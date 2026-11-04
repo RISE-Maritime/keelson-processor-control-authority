@@ -94,6 +94,8 @@ def test_a_free_conn_is_taken_through_the_gate_and_carries_the_gates_fence(tmp_p
     conn = m.state.leases[model.CONN]
     assert conn.holder == "ted@ROC-1" and m.state.active_station == "ROC-1"
     assert all(row.authority_lease_id == conn.lease_id and row.authority_holder == "ted@ROC-1" for row in gate.mappings)
+    # ...and that id is the token on the published record: the only identity a gate can check.
+    assert conn.lease_id == conn.token
 
 
 def test_the_proposal_carries_no_fence_and_the_manager_never_makes_one(tmp_path, clock, gate):

@@ -80,7 +80,12 @@ class Fence:
 
 @dataclass(frozen=True)
 class Lease:
-    """A lease or a session. `renewed_ms` is on THIS process's monotonic clock."""
+    """A lease or a session. `renewed_ms` is on THIS process's monotonic clock.
+
+    `lease_id` equals `token`. `CommandAuthority` carries no lease-id field, so the token published
+    on the slot is the only identity a gate can check a mapping's `authority_lease_id` against. The
+    token is broadcast on a stored slot anyway: it is an interlock, not a credential
+    (command_authority, "Token authenticity")."""
 
     slot: str
     holder: str
@@ -281,7 +286,8 @@ def take_lease(state: State, policy: Policy, role: str, principal: str, site: st
     held = state.live_lease(slot, now_ms)
     if held is not None and held.holder != principal:
         return _same(state, REFUSED_HELD, f"held by {held.holder}: request it from them")
-    lease = Lease(slot, principal, site, token or new_id(), new_id(), now_ms, policy.ttl(role))
+    tok = token or new_id()
+    lease = Lease(slot, principal, site, tok, tok, now_ms, policy.ttl(role))
     st = replace(state, leases={**state.leases, slot: lease})
     return Decision(st, ACCEPTED, "", (PublishLease(slot),), (_audit("take", slot=slot, holder=principal, site=site),))
 
@@ -372,7 +378,7 @@ def session_heartbeat(state: State, policy: Policy, role: str, principal: str, s
     ours = lease is not None and lease.assignment_id == assignment_id
     if ours and lease.token != token and lease.live(now_ms):
         return _same(state, REFUSED_HELD, "another session of this assignment is live")
-    lease_id = lease.lease_id if ours and lease.token == token else new_id()
+    lease_id = token  # the published token IS the lease's identity (see Lease)
     nxt = Lease(slot, principal, site, token, lease_id, now_ms, policy.session_ttl_ms, assignment_id)
     return Decision(replace(state, leases={**state.leases, slot: nxt}), ACCEPTED, "", (PublishLease(slot),))
 
@@ -561,7 +567,10 @@ def begin_transfer(state: State, policy: Policy, req: TransferRequest, now_ms: i
     if conn_holder and policy.is_software(conn_holder) and req.kind != GRANT:
         return _same(state, REFUSED_SOFTWARE, "take-control and handover give the helm to a human")
 
-    lease_id = new_id() if conn_holder else ""
+    # The new conn lease's token, known now so the rows can name it: a gate checks a mapping's
+    # authority_lease_id against the token on the published conn record (see Lease).
+    conn_token = new_id() if conn_holder else ""
+    lease_id = conn_token
     if req.kind == ABORT_AUTOMATION:
         if req.mappings:
             return _same(state, REFUSED_MALFORMED, "an abort proposes no map: the gate enters its transition state")
@@ -575,7 +584,7 @@ def begin_transfer(state: State, policy: Policy, req: TransferRequest, now_ms: i
 
     tid = transfer_id or new_id()
     t = Transfer(tid, req.kind, mappings, station, req.requester, req.reason, PREPARED,
-                 conn_holder=conn_holder, conn_site=conn_site, conn_token=new_id() if conn_holder else "",
+                 conn_holder=conn_holder, conn_site=conn_site, conn_token=conn_token,
                  conn_lease_id=lease_id)
     st = replace(state, transfers={**state.transfers, tid: t})
     return Decision(st, PENDING, "", (GatePrepare(t, policy.prepare_ttl_ms),),
