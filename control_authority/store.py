@@ -90,7 +90,9 @@ class Store:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, isolation_level=None)  # explicit BEGIN/COMMIT below
+        # Explicit BEGIN/COMMIT below. The RPC handlers run on zenoh's queryable threads, so the
+        # connection crosses threads -- safely, because every access is under rpc.Handlers' one lock.
+        self.db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript(
@@ -145,3 +147,9 @@ class Store:
     def audit(self, limit: int = 1000) -> list[dict]:
         rows = self.db.execute("SELECT record FROM audit ORDER BY seq DESC LIMIT ?", (limit,)).fetchall()
         return [json.loads(r[0]) for r in reversed(rows)]
+
+    def audit_after(self, after_seq: int = 0, limit: int = 1000) -> list[tuple[int, int, dict]]:
+        """(seq, at_ms, record), oldest first. `at_ms` is the wall clock the service stamped."""
+        rows = self.db.execute("SELECT seq, at_ms, record FROM audit WHERE seq > ? ORDER BY seq LIMIT ?",
+                               (after_seq, limit)).fetchall()
+        return [(int(s), int(t), json.loads(r)) for s, t, r in rows]

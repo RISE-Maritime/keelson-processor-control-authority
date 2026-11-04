@@ -93,20 +93,32 @@ def _assignment_to_proto(a: Assignment | None) -> PbAssignment | None:
     return pb
 
 
-def lease_record(st: State, slot: str, issuer_id: str, released: bool = False, now: Timestamp | None = None) -> CommandAuthority:
+def slot_path(vessel_id: str, slot: str) -> str:
+    """The `command_authority` key's template: `{vessel}` for the conn, `{vessel}/{slot}` otherwise
+    (`{vessel}/engineer`, `{vessel}/payload/{id}`, `{vessel}/overall/session`, `{vessel}/navigation`)."""
+    return vessel_id if slot == model.CONN else f"{vessel_id}/{slot}"
+
+
+def lease_record(st: State, slot: str, issuer_id: str, released: bool = False, now: Timestamp | None = None,
+                 lease=None) -> CommandAuthority:
     """The `command_authority` record for one slot, as the manager publishes it. A conn record carries
-    the fence the gate minted for the map in force -- never one of the manager's own."""
+    the fence the gate minted for the map in force -- never one of the manager's own. A released
+    lease is no longer in the state, so its identity is passed in."""
     role_name = slot.split("/")[0]
     rec = CommandAuthority(vessel_id=st.vessel_id, role=ROLE[role_name], issued_by=issuer_id, released=released,
                            active_control_station=st.active_station, responsible_roc=st.responsible_roc)
     if slot.startswith("payload/"):
         rec.payload_id = slot.split("/", 1)[1]
-    lease = st.leases.get(slot)
+    lease = lease if lease is not None else st.leases.get(slot)
     if lease is not None:
         rec.controller_id, rec.controller_site, rec.token = lease.holder, lease.site, lease.token
         rec.lease_ttl_seconds = max(1, lease.ttl_ms // 1000)
         rec.kind = RecordKind.RECORD_KIND_SESSION if slot.endswith("/session") else RecordKind.RECORD_KIND_LEASE
-    if role_name == model.CONN and st.in_force.fence is not None:
+    if slot.endswith("/session"):
+        a = st.assignment(role_name)
+        if a is not None:
+            rec.assignment.CopyFrom(_assignment_to_proto(a))
+    if role_name == model.CONN and st.in_force.fence is not None and not released:
         rec.fence.CopyFrom(fence_to_proto(st.in_force.fence))
     if now is not None:
         rec.last_heartbeat.CopyFrom(now)
@@ -137,3 +149,73 @@ def navigation_document(st: State) -> NavigationAuthority:
             fa.envelope.CopyFrom(FunctionEnvelope(**fn.envelope))
         doc.functions.append(fa)
     return doc
+
+
+def assignment_record(st: State, role: str, issuer_id: str) -> CommandAuthority:
+    """The stored assignment record at `{vessel}/overall` or `{vessel}/navigational`: no TTL."""
+    rec = CommandAuthority(vessel_id=st.vessel_id, role=ROLE[role], kind=RecordKind.RECORD_KIND_ASSIGNMENT,
+                           issued_by=issuer_id, lease_ttl_seconds=0, active_control_station=st.active_station,
+                           responsible_roc=st.responsible_roc)
+    a = st.assignment(role)
+    if a is None:
+        rec.released = True
+    else:
+        rec.controller_id = a.assignee
+        rec.assignment.CopyFrom(_assignment_to_proto(a))
+    return rec
+
+
+def navigation_record(st: State, issuer_id: str) -> CommandAuthority:
+    """The navigation authority document at `{vessel}/navigation`: an assignment, not a lease."""
+    rec = CommandAuthority(vessel_id=st.vessel_id, role=Role.ROLE_NAVIGATION_AUTHORITY,
+                           kind=RecordKind.RECORD_KIND_ASSIGNMENT, issued_by=issuer_id, lease_ttl_seconds=0)
+    rec.navigation_authority.CopyFrom(navigation_document(st))
+    return rec
+
+
+def function_name(value: int) -> str:
+    """keelson.NavigationFunction → the manager's key, e.g. NAVIGATION_FUNCTION_TRACK_KEEPING → track_keeping."""
+    return NavigationFunction.Name(value).removeprefix("NAVIGATION_FUNCTION_").lower()
+
+
+def nav_function_from_proto(fa: FunctionAuthority):
+    from google.protobuf.json_format import MessageToDict
+
+    env = MessageToDict(fa.envelope, preserving_proto_field_name=True) if fa.HasField("envelope") else {}
+    return model.NavFunction(fa.holder, fa.holder_lease_id, int(fa.control_method), env)
+
+
+def authority_state(st: State, issuer_id: str, heartbeat_interval_seconds: int, feed_ttl_seconds: int):
+    from keelson.interfaces.AuthorityManager_pb2 import AuthorityState
+
+    out = AuthorityState(vessel_id=st.vessel_id, active_control_station=st.active_station, reconciled=st.reconciled,
+                         records=[lease_record(st, slot, issuer_id) for slot in sorted(st.leases)],
+                         mappings=[mapping_to_proto(m, st.in_force.fence) for m in st.in_force.mappings])
+    out.assignments.CopyFrom(assignment_feed(st, issuer_id, heartbeat_interval_seconds, feed_ttl_seconds))
+    out.navigation.CopyFrom(navigation_document(st))
+    if st.in_force.fence is not None:
+        out.fence.CopyFrom(fence_to_proto(st.in_force.fence))
+    return out
+
+
+def audit_record(seq: int, at_wall_ms: int, rec: dict):
+    """One stored audit dict as `AuditRecord`: the common fields typed, the rest as JSON."""
+    import json
+
+    from keelson.interfaces.AuthorityManager_pb2 import AuditRecord
+
+    def rows(key):
+        return [ControlMapping(dof=r["dof"], authority_holder=r["authority_holder"], execution_source=r["execution_source"])
+                for r in rec.get(key) or []]
+
+    typed = {"event", "transfer_id", "by", "station", "old_map", "new_map", "old_fence", "fence", "reason"}
+    out = AuditRecord(seq=seq, event=rec.get("event", ""), transfer_id=rec.get("transfer_id", ""),
+                      requested_by=rec.get("by", ""), station=rec.get("station", ""), reason=rec.get("reason", ""),
+                      old_mappings=rows("old_map"), new_mappings=rows("new_map"),
+                      detail_json=json.dumps({k: v for k, v in rec.items() if k not in typed}, sort_keys=True))
+    out.at.FromMilliseconds(at_wall_ms)
+    for key, field_name in (("old_fence", "old_fence"), ("fence", "new_fence")):
+        f = rec.get(key)
+        if f:
+            getattr(out, field_name).CopyFrom(PbFence(term=f["term"], generation=f["generation"]))
+    return out

@@ -7,17 +7,15 @@ transfer, never a fence**: the gate validates it against what it is emitting now
 and ACKs with it, and only a COMMIT that the manager has already written to its own store activates.
 
 - **Protocol:** keelson `protocols/command_authority.yaml`, `CommandAuthority.proto`,
-  `ControlMapping.proto` and `NavigationAuthority.proto` (keelson PR #331).
+  `ControlMapping.proto` and `NavigationAuthority.proto` (keelson PR #331). The interfaces are
+  `authority_manager/v1` (served here) and `control_gate/v1` (called here), on the keelson branch
+  `feat/authority-manager-and-control-gate`, which is stacked on #331.
 - **Design:** crowsnest-dev `docs/COMMAND-ARCHITECTURE.md` §0, §4 and §5. The work item is crowsnest-dev #84.
 - **Replaces** `keelson-processor-supervisor`'s `authority.py` (`open` / `exclusive`, single station).
 
-> **Status: the core only. It talks to no network.** The decisions, the store and the sequence are
-> built and tested against a **fake gate**. The Zenoh wiring waits for two interfaces that keelson
-> does not have yet (`command_authority` `not_solved`, "The manager and the gate as interfaces"):
-> the manager's own control-plane surface (`request / renew / release / transfer / take_control /
-> abort_automation / assume_command / get / history`) and the gate's `control_gate` class
-> (`prepare / commit / reconcile / abort_automation_direct`). They are written as a keelson PR stacked
-> on #331, after this core. Never run this against a real vessel or a shared network.
+> **Status: built and tested against a fake gate. It actuates nothing.** The motion gate it calls
+> (crowsnest-dev #85) does not exist yet. Until it does, every transfer is refused NOT_RECONCILED,
+> because the gate never answers. Never run this against a real vessel or a shared network.
 
 ## What it does
 
@@ -68,16 +66,36 @@ service does not start. Unlike the safety supervisor, there is no "more inhibite
 back to that would be safe here: who holds which role is not a thing to guess. The procedure for
 re-initialising a store, which would reconcile everything from the gate, is not written yet.
 
+## Keys
+
+| Serves / calls | Writes |
+| --- | --- |
+| serves `authority_manager/v1` as responder `authority-manager` | `command_authority/{vessel}` (the conn), `…/{vessel}/engineer`, `…/{vessel}/payload/{id}`, `…/{vessel}/overall[/session]`, `…/{vessel}/navigational[/session]`, `…/{vessel}/navigation` |
+| calls `control_gate/v1` on responder `control-gate` (`--gate-responder-id`) | `command_assignment/{vessel}`, on every change and at `--heartbeat-s` |
+| | `alarm/authority-manager`: a lapsed session, a succession, a reconcile disagreement, an unapplied transfer |
+| | liveliness: the source token, the RPC interface token, and the pubsub subjects |
+
+Every record is republished at boot, so the router's storage agrees with the store. One lock decides:
+each RPC is handled whole, including its gate round trips, before the next one starts.
+
+## Running (development only)
+
+```bash
+authority-manager2keelson -r rise -e <vessel> --state-dir ./state --policy config/policy.json \
+  --gate-responder-id control-gate --connect tcp/<router>:7447
+```
+
 ## Developing before the build
 
-The pin is the experimental build that carries #331, still to be cut. Until it exists, `uv sync`
-cannot resolve it. In the meantime, develop against the #331 worktree's SDK **without committing
-that**:
+The pin is an experimental build that carries both #331 and the interfaces branch. That build
+includes only open PRs, so the interfaces branch must be opened as a PR before the build is cut.
+Until the build exists, `uv sync` cannot resolve the pin. In the meantime, develop against the
+interfaces worktree's SDK **without committing that**:
 
 ```bash
 uv venv --python 3.13 .venv
-uv pip install --python .venv/bin/python -e ../keelson.worktrees/command-roles/sdks/python pytest==8.3.4 ruff==0.14.11
-.venv/bin/python -m pytest -q
+uv pip install --python .venv/bin/python -e ../keelson.worktrees/authority-interfaces/sdks/python pytest==8.3.4 ruff==0.14.11
+.venv/bin/python -m pytest -q          # unit + e2e (e2e: loopback, multicast scouting off)
 .venv/bin/ruff check .
 ```
 
@@ -86,8 +104,7 @@ When the build exists: set its exact version in `pyproject.toml`, run `uv lock`,
 
 ## Not in this cut
 
-- The Zenoh wiring, the CLI and the Dockerfile; they wait for the interfaces.
-- The audit-record publication.
+- Audit records on a subject of their own: `history` serves them from the store.
 - The ENGINEER and PAYLOAD_AUTHORITY holder changes as gate transfers: today they are plain
   leases. Those transfers need the inherited constraint snapshot and the plant and payload gates.
 - Fencing NAVIGATION_AUTHORITY on take-control and abort. The CONN is fenced; what happens to the

@@ -16,4 +16,16 @@ jobs:
       - name: Lint
         run: uv run --locked ruff check .
       - name: Unit tests
-        run: uv run --locked pytest -vv
+        run: uv run --locked pytest -vv -m "not e2e"
+      # Loopback only, multicast scouting off: the e2e never reaches another network.
+      - name: End-to-end tests
+        run: uv run --locked pytest -vv -m e2e
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t keelson-processor-control-authority .
+      - name: Smoke test the entry point
+        run: docker run --rm keelson-processor-control-authority "authority-manager2keelson --help"

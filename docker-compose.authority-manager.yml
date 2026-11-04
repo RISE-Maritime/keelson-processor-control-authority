@@ -1,0 +1,15 @@
+# The onboard authority manager: exactly ONE per vessel (redundancy is out of scope until leader
+# fencing is defined). The store on a persistent volume; the policy is the vessel's control matrix.
+services:
+  authority-manager:
+    image: ghcr.io/rise-maritime/keelson-processor-control-authority:latest
+    container_name: authority-manager
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - authority-state:/state
+      - ./config/policy.json:/config/policy.json:ro
+    command: "authority-manager2keelson --log-level 20 -r rise -e <vessel_id> --state-dir /state --policy /config/policy.json --gate-responder-id control-gate"
+
+volumes:
+  authority-state:

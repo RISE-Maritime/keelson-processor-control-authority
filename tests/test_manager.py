@@ -77,7 +77,7 @@ def master(m, who="ted@ROC-1", site="ROC-1", role=model.OVERALL, token="sess-1")
     if role == model.OVERALL:
         m.assign(model.OVERALL, who, "procedure")
     else:
-        m.assign(model.NAVIGATIONAL, who, m.state.overall.assignee, m.state.overall.revision)
+        m.assign(model.NAVIGATIONAL, who, m.state.overall.assignee, m.state.overall.revision, "sess-1")
     a = m.state.assignment(role)
     assert m.session(role, who, site, token, a.assignment_id).outcome == model.ACCEPTED
     return a
@@ -272,6 +272,12 @@ def test_manager_dead_and_the_conn_lapses_the_gate_fences_alone_and_the_manager_
     assert any(r["event"] == "reconcile_disagreement" for r in m2.history())
 
 
+def test_a_fresh_manager_adopts_the_gate_without_an_alarm(tmp_path, clock, gate):
+    bus = Bus()
+    m = make(tmp_path, clock, gate, bus=bus)
+    assert m.state.in_force.fence == gate.fence and bus.alarms() == []
+
+
 def test_a_commit_the_gate_no_longer_remembers_is_abandoned_and_forces_a_reconcile(tmp_path, clock, gate):
     m = make(tmp_path, clock, gate)
     gate.on_commit = lambda tid: gate.restart()
@@ -379,15 +385,18 @@ def test_assume_command_revokes_the_old_masters_authorisation(tmp_path, clock, g
     r = m.transfer(TransferRequest(model.ABORT_AUTOMATION, "ted@ROC-1", "ROC-1", assignment_revision=old.revision,
                                    session_token="sess-1"))
     assert r.outcome == model.REFUSED_UNAUTHORISED  # no longer the assignee at all
-    assert m.assign(model.NAVIGATIONAL, "anna@ROC-2", "ted@ROC-1", old.revision).outcome == model.REFUSED_UNAUTHORISED
-    assert m.assign(model.NAVIGATIONAL, "anna@ROC-2", "chief@ROC-2", old.revision).outcome == model.REFUSED_STALE_REVISION
+    assert m.assign(model.NAVIGATIONAL, "anna@ROC-2", "ted@ROC-1", old.revision, "sess-1").outcome == model.REFUSED_UNAUTHORISED
+    m.session(model.OVERALL, "chief@ROC-2", "ROC-2", "sess-c", m.state.overall.assignment_id)
+    assert m.assign(model.NAVIGATIONAL, "anna@ROC-2", "chief@ROC-2", old.revision, "sess-c").outcome == model.REFUSED_STALE_REVISION
+    assert m.assign(model.NAVIGATIONAL, "anna@ROC-2", "chief@ROC-2", m.state.overall.revision, "nope").outcome \
+        == model.REFUSED_UNAUTHORISED  # the master's own session, or nothing
 
 
 def test_the_same_assignee_acting_under_an_older_revision_is_refused(tmp_path, clock, gate):
     m = make(tmp_path, clock, gate)
     master(m)
     first = master(m, "anna@ROC-2", "ROC-2", model.NAVIGATIONAL, token="sess-2")
-    m.assign(model.NAVIGATIONAL, "bo@ROC-2", "ted@ROC-1", m.state.overall.revision)
+    m.assign(model.NAVIGATIONAL, "bo@ROC-2", "ted@ROC-1", m.state.overall.revision, "sess-1")
     again = master(m, "anna@ROC-2", "ROC-2", model.NAVIGATIONAL, token="sess-3")
     assert again.revision == first.revision + 2
     r = m.transfer(TransferRequest(model.ABORT_AUTOMATION, "anna@ROC-2", "ROC-2", assignment_revision=first.revision,

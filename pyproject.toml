@@ -25,6 +25,7 @@ packages = ["control_authority"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["e2e: end-to-end test that runs the CLI against an isolated loopback Zenoh peer and a fake gate"]
 
 [tool.ruff]
 line-length = 140

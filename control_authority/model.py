@@ -208,8 +208,9 @@ class GateCommit:
 
 @dataclass(frozen=True)
 class PublishLease:
-    slot: str  # the service reads the record from the state it has just committed
+    slot: str  # the service reads a live record from the state it has just committed
     released: bool = False
+    lease: Lease | None = None  # a released lease is gone from the state: its identity travels here
 
 
 @dataclass(frozen=True)
@@ -235,6 +236,7 @@ class Decision:
     effects: tuple = ()
     audits: tuple = ()
     transfer_id: str = ""
+    rejected_mapping_ids: tuple = ()  # the rows a gate NAK named
 
 
 def _same(state: State, outcome: str, detail: str = "", audits=()) -> Decision:
@@ -303,7 +305,7 @@ def release(state: State, slot: str, token: str) -> Decision:
         return _same(state, REFUSED_UNAUTHORISED, "not this lease's token")
     leases = dict(state.leases)
     del leases[slot]
-    return Decision(replace(state, leases=leases), ACCEPTED, "", (PublishLease(slot, released=True),),
+    return Decision(replace(state, leases=leases), ACCEPTED, "", (PublishLease(slot, True, lease),),
                     (_audit("release", slot=slot, holder=lease.holder),))
 
 
@@ -316,7 +318,7 @@ def expire(state: State, now_ms: int) -> Decision:
     leases = {s: lease for s, lease in state.leases.items() if s not in lapsed}
     effects, audits = [], []
     for s in lapsed:
-        effects.append(PublishLease(s, released=True))
+        effects.append(PublishLease(s, True, state.leases[s]))
         audits.append(_audit("expire", slot=s, holder=state.leases[s].holder))
         if s.endswith("/session"):
             role = s.split("/")[0]
@@ -335,20 +337,20 @@ def rebase_after_restart(state: State, now_ms: int) -> State:
 # ---------------------------------------------------------------------------- assignments
 
 
-def assign(state: State, policy: Policy, role: str, assignee: str, by: str, *, by_revision: int | None = None) -> Decision:
+def assign(state: State, policy: Policy, role: str, assignee: str, by: str, *, by_revision: int | None = None,
+           session_token: str = "", now_ms: int = 0) -> Decision:
     """Write an assignment by procedure or by grant. The master assigns NAVIGATIONAL; the OVERALL
-    assignment changes by procedure (`by="procedure"`) or by the current master's own grant. Each
-    change of assignee increments the revision and draws a new assignment_id."""
+    assignment changes by procedure (`by="procedure"`) or by the current master's own grant -- a
+    privileged request like any other: the assignee, the current revision and a live session (I7).
+    Each change of assignee increments the revision and draws a new assignment_id."""
     if role not in ASSIGNMENT_ROLES:
         return _same(state, REFUSED_MALFORMED, "not an assignment role")
     if policy.is_software(assignee):
         return _same(state, REFUSED_SOFTWARE, f"{role.upper()} is never software")
     if by != "procedure":
-        master = state.overall
-        if master is None or master.assignee != by:
-            return _same(state, REFUSED_UNAUTHORISED, "only the OVERALL_COMMAND assignee assigns, or a procedure")
-        if by_revision != master.revision:
-            return _same(state, REFUSED_STALE_REVISION, f"acting under revision {by_revision}, current is {master.revision}")
+        outcome, detail, _ = authorise_privileged(state, (OVERALL,), by, by_revision, session_token, now_ms)
+        if outcome != ACCEPTED:
+            return _same(state, outcome, "only the OVERALL_COMMAND assignee assigns, or a procedure: " + detail)
     current = state.assignment(role)
     if current is not None and current.assignee == assignee and not current.synthesised:
         return _same(state, ACCEPTED, "already assigned")
@@ -593,7 +595,7 @@ def on_ack(state: State, transfer_id: str, accepted: bool, fence: Fence | None, 
         nt = replace(t, phase=REJECTED, detail=reason or "refused by the gate")
         return Decision(replace(state, transfers={**state.transfers, transfer_id: nt}), REFUSED_BY_GATE, nt.detail, (),
                         (_audit("rejected", transfer_id=transfer_id, reason=nt.detail,
-                                rejected_mapping_ids=list(rejected_mapping_ids)),), transfer_id)
+                                rejected_mapping_ids=list(rejected_mapping_ids)),), transfer_id, tuple(rejected_mapping_ids))
     nt = replace(t, phase=COMMITTED, fence=fence)
     return Decision(replace(state, transfers={**state.transfers, transfer_id: nt}), PENDING, "",
                     (GateCommit(transfer_id, fence),),
@@ -627,7 +629,7 @@ def _activate(state: State, policy: Policy, t: Transfer, now_ms: int, how: str) 
         conn = leases.get(CONN)
         if conn is not None and policy.is_software(conn.holder):
             del leases[CONN]  # the automation's conn is fenced; its lease ends with it
-            effects.append(PublishLease(CONN, released=True))
+            effects.append(PublishLease(CONN, True, conn))
     nt = replace(t, phase=ACTIVE)
     st = replace(state, leases=leases, transfers={**state.transfers, t.transfer_id: nt},
                  in_force=InForce(mappings, t.station, fence), active_station=t.station)
@@ -670,7 +672,8 @@ def reconcile(state: State, policy: Policy, gate_fence: Fence | None, gate_mappi
                 st = replace(st, transfers={**st.transfers, t.transfer_id: nt})
                 audits.append(_audit("abandoned", transfer_id=t.transfer_id, reason=nt.detail))
     gate = InForce(tuple(gate_mappings), gate_station, gate_fence)
-    if gate != st.in_force:
+    # A manager that has recorded nothing yet (a fresh store) has nothing to disagree with.
+    if st.in_force.fence is not None and gate != st.in_force:
         audits.append(_audit("reconcile_disagreement", manager_fence=_fence_json(st.in_force.fence),
                              gate_fence=_fence_json(gate_fence), manager_station=st.in_force.station, gate_station=gate_station))
         effects.append(Alarm("the gate's state differed from the manager's record; the gate's was adopted"))

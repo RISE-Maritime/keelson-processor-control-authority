@@ -57,15 +57,22 @@ def mono_ms() -> int:
     return int(time.monotonic() * 1000)
 
 
+def wall_ms() -> int:
+    """For audit timestamps only -- never for an expiry (§0)."""
+    return int(time.time() * 1000)
+
+
 class Manager:
     def __init__(self, *, store, policy: Policy, vessel_id: str, gate: GatePort,
-                 publish: Callable[[object, State], None], now_ms: Callable[[], int] = mono_ms):
+                 publish: Callable[[object, State], None], now_ms: Callable[[], int] = mono_ms,
+                 audit_ms: Callable[[], int] = wall_ms):
         self.store = store
         self.policy = policy
         self.vessel_id = vessel_id
         self.gate = gate
         self._publish = publish
         self.now_ms = now_ms
+        self.audit_ms = audit_ms
         self.state: State | None = None
 
     # ------------------------------------------------------------------ boot
@@ -79,7 +86,7 @@ class Manager:
         if st.vessel_id != self.vessel_id:
             raise ValueError(f"the store is for vessel {st.vessel_id!r}, this manager is for {self.vessel_id!r}")
         st = model.rebase_after_restart(st, now)
-        self.store.commit(st, ({"event": "boot", "restored": stored is not None},), now)
+        self.store.commit(st, ({"event": "boot", "restored": stored is not None},), self.audit_ms())
         self.state = st
         self.reconcile()
         return self.state
@@ -139,8 +146,9 @@ class Manager:
     def release(self, slot, token) -> Decision:
         return self._apply(model.release(self.state, slot, token))
 
-    def assign(self, role, assignee, by, by_revision=None) -> Decision:
-        return self._apply(model.assign(self.state, self.policy, role, assignee, by, by_revision=by_revision))
+    def assign(self, role, assignee, by, by_revision=None, session_token="") -> Decision:
+        return self._apply(model.assign(self.state, self.policy, role, assignee, by, by_revision=by_revision,
+                                        session_token=session_token, now_ms=self.now_ms()))
 
     def session(self, role, principal, site, token, assignment_id) -> Decision:
         return self._apply(model.session_heartbeat(self.state, self.policy, role, principal, site, token, assignment_id,
@@ -171,7 +179,7 @@ class Manager:
     def _apply(self, d: Decision) -> Decision:
         """Commit, then run the non-gate effects. Gate effects are run by _follow, in order."""
         if d.state is not self.state or d.audits:
-            self.store.commit(d.state, d.audits, self.now_ms())
+            self.store.commit(d.state, d.audits, self.audit_ms())
         self.state = d.state
         for effect in d.effects:
             if isinstance(effect, (model.GatePrepare, model.GateCommit)):
