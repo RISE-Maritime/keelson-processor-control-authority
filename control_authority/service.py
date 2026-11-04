@@ -150,6 +150,9 @@ class Manager:
         return self._apply(model.assign(self.state, self.policy, role, assignee, by, by_revision=by_revision,
                                         session_token=session_token, now_ms=self.now_ms()))
 
+    def bootstrap_overall(self, principal, maintainer) -> Decision:
+        return self._apply(model.bootstrap_overall(self.state, self.policy, principal, maintainer))
+
     def session(self, role, principal, site, token, assignment_id) -> Decision:
         return self._apply(model.session_heartbeat(self.state, self.policy, role, principal, site, token, assignment_id,
                                                    self.now_ms()))

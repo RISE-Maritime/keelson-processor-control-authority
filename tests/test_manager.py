@@ -23,6 +23,7 @@ POLICY = parse({
     "succession": {"overall": ["chief@ROC-2"], "navigational": "*"},
 })
 NAV = "navigation/0@usv-alpha"
+MASTER_ID = "ted@ROC-1"
 
 
 class Clock:
@@ -502,3 +503,30 @@ def test_the_state_survives_a_restart(tmp_path, clock, gate):
     assert m2.state.overall == st.overall and m2.state.in_force == st.in_force
     assert m2.state.leases[model.CONN].token == st.leases[model.CONN].token
     assert [r["event"] for r in m2.history()].count("active") == 1
+
+
+# ---------------------------------------------------------------------------- --assign-overall (joint review of f88320c)
+
+
+def test_bootstrap_assigns_only_when_nobody_holds_overall(tmp_path, clock, gate):
+    m = make(tmp_path, clock, gate)
+    assert m.bootstrap_overall(MASTER_ID, "").outcome == model.REFUSED_MALFORMED  # names its maintainer
+    d = m.bootstrap_overall(MASTER_ID, "engineer@vessel")
+    assert d.outcome == model.ACCEPTED and m.state.overall.assignee == MASTER_ID and m.state.overall.revision == 1
+    assert m.bootstrap_overall(MASTER_ID, "engineer@vessel").detail == "already assigned"
+    assert m.state.overall.revision == 1
+    assert any(r["event"] == "bootstrap_overall" and r["maintainer"] == "engineer@vessel" for r in m.history())
+
+
+def test_bootstrap_never_undoes_a_succession(tmp_path, clock, gate):
+    m = make(tmp_path, clock, gate)
+    m.bootstrap_overall(MASTER_ID, "engineer@vessel")
+    m.assume_command(model.OVERALL, "chief@ROC-2", "master unreachable", ["no answer"], ["owner"])
+    d = m.bootstrap_overall(MASTER_ID, "engineer@vessel")
+    assert d.outcome == model.REFUSED_HELD and m.state.overall.assignee == "chief@ROC-2"
+
+
+def test_bootstrap_refuses_software(tmp_path, clock, gate):
+    m = make(tmp_path, clock, gate)
+    assert m.bootstrap_overall(NAV, "engineer@vessel").outcome == model.REFUSED_SOFTWARE
+

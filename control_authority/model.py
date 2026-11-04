@@ -366,6 +366,30 @@ def assign(state: State, policy: Policy, role: str, assignee: str, by: str, *, b
                     (_audit("assign", role=role, assignee=assignee, by=by, revision=nxt.revision),))
 
 
+def bootstrap_overall(state: State, policy: Policy, principal: str, maintainer: str) -> Decision:
+    """The maintenance act that bootstraps the master (--assign-overall), and NOTHING more (joint
+    review of f88320c, 2026-11-04).
+
+    It assigns OVERALL_COMMAND only when nobody holds it. The same principal again is a no-op. Anyone
+    else holding it is REFUSED_HELD: a flag left in a compose file would otherwise re-assign its
+    principal on every restart, silently undoing a succession -- the stale master coming back that
+    the revision exists to stop (I7). A deliberate change of master is a grant or assume_command.
+    The audit names the maintainer who did it."""
+    if not maintainer:
+        return _same(state, REFUSED_MALFORMED, "a maintenance act names who did it (--maintainer)")
+    current = state.overall
+    if current is not None and current.assignee != principal:
+        return _same(state, REFUSED_HELD, f"OVERALL_COMMAND is held by {current.assignee} (revision {current.revision}): "
+                                          "remove --assign-overall; a change of master is a grant or assume_command")
+    if current is not None:
+        return _same(state, ACCEPTED, "already assigned")
+    d = assign(state, policy, OVERALL, principal, "procedure")
+    if d.outcome != ACCEPTED:
+        return d
+    return replace(d, audits=(_audit("bootstrap_overall", role=OVERALL, assignee=principal, maintainer=maintainer,
+                                     revision=d.state.overall.revision),))
+
+
 def session_heartbeat(state: State, policy: Policy, role: str, principal: str, site: str, token: str, assignment_id: str,
                       now_ms: int) -> Decision:
     """The assignee's presence. A session must name the CURRENT assignment it belongs to."""

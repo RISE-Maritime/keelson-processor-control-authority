@@ -236,7 +236,7 @@ def test_a_restart_reconciles_toward_a_gate_that_fenced_alone(h):
 
 def test_the_master_is_bootstrapped_by_a_maintenance_flag_once(h):
     h.gate.serve()
-    h.start_args = ["--assign-overall", "ted@ROC-1"]
+    h.start_args = ["--assign-overall", "ted@ROC-1", "--maintainer", "engineer@vessel"]
     h.start()
     st = h.call("get", pb.GetAuthorityRequest(), pb.AuthorityState)
     assert st.assignments.overall.assignee == "ted@ROC-1" and st.assignments.overall.revision == 1
@@ -245,14 +245,51 @@ def test_the_master_is_bootstrapped_by_a_maintenance_flag_once(h):
     st = h.call("get", pb.GetAuthorityRequest(), pb.AuthorityState)
     assert st.assignments.overall.revision == 1
     hist = h.call("history", pb.HistoryRequest(), pb.HistoryReply)
-    assert [r.event for r in hist.records].count("assign") == 1
+    boots = [r for r in hist.records if r.event == "bootstrap_overall"]
+    assert len(boots) == 1 and "engineer@vessel" in boots[0].detail_json
 
 
 def test_a_process_is_never_bootstrapped_as_master(h, tmp_path):
     policy = tmp_path / "p.json"
     policy.write_text(json.dumps({"command_profile": "test", "dofs": DOFS, "processes": ["navigation/0@testvessel"]}))
     p = subprocess.run([sys.executable, str(ROOT / "bin/authority-manager2keelson.py"), "-r", REALM, "-e", V,
-                        "--state-dir", str(tmp_path / "s"), "--policy", str(policy), "--assign-overall", "navigation/0@testvessel",
+                        "--state-dir", str(tmp_path / "s"), "--policy", str(policy), "--assign-overall", "navigation/0@testvessel", "--maintainer", "engineer@vessel",
                         "--mode", "peer", "--connect", f"tcp/127.0.0.1:{h.port}", "--gate-timeout-s", "0.5"],
                        capture_output=True, text=True, timeout=30, check=False)
     assert p.returncode == 2 and "never software" in (p.stdout + p.stderr)
+
+
+def test_a_stale_flag_after_a_succession_refuses_to_start_rather_than_undo_it(h):
+    """Joint review of f88320c (B1): the flag left in a compose file must never re-assign its principal."""
+    h.gate.serve()
+    h.start_args = ["--assign-overall", "ted@ROC-1", "--maintainer", "engineer@vessel"]
+    h.start()
+    h.stop_proc()
+    # The master changes while the manager is down: a succession recorded in its store.
+    from control_authority import model
+    from control_authority.policy import load
+    from control_authority.store import Store
+
+    store = Store(h.tmp / "state" / "authority.sqlite")
+    st = store.load()
+    pol = load(h.tmp / "policy.json")
+    d = model.assume_command(st, model.replace(pol, succession={model.OVERALL: "*"}), model.OVERALL, "chief@ROC-2",
+                             "master unreachable", ["no answer"], ["owner"], 0)
+    store.commit(d.state, d.audits)
+    store.close()
+    out = subprocess.run([sys.executable, str(ROOT / "bin/authority-manager2keelson.py"), "-r", REALM, "-e", V,
+                          "--zenoh-config", str(h.tmp / "zenoh.json5"), "--state-dir", str(h.tmp / "state"), "--policy",
+                          str(h.tmp / "policy.json"), "--assign-overall", "ted@ROC-1", "--maintainer", "engineer@vessel",
+                          "--gate-timeout-s", "1"], capture_output=True, text=True, timeout=30, check=False)
+    assert out.returncode == 2 and "held by chief@ROC-2" in (out.stdout + out.stderr)
+
+
+def test_a_maintenance_act_names_its_maintainer(h, tmp_path):
+    policy = tmp_path / "p.json"
+    policy.write_text(json.dumps({"command_profile": "test", "dofs": DOFS}))
+    p = subprocess.run([sys.executable, str(ROOT / "bin/authority-manager2keelson.py"), "-r", REALM, "-e", V,
+                        "--state-dir", str(tmp_path / "s"), "--policy", str(policy), "--assign-overall", "ted@ROC-1",
+                        "--mode", "peer", "--connect", f"tcp/127.0.0.1:{h.port}", "--gate-timeout-s", "0.5"],
+                       capture_output=True, text=True, timeout=30, check=False)
+    assert p.returncode == 2 and "--maintainer" in (p.stdout + p.stderr)
+

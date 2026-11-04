@@ -85,10 +85,17 @@ authority-manager2keelson -r rise -e <vessel> --state-dir ./state --policy confi
   --gate-responder-id control-gate --connect tcp/<router>:7447
 ```
 
-**Bootstrapping the master** is a maintenance act, not an RPC: `--assign-overall PRINCIPAL` assigns
-OVERALL_COMMAND by procedure, once, at boot. It is audited as `assign … by procedure`, refused for a
-process, and changes nothing when that principal already holds it. Every later change of master goes
-through a grant or `assume_command`.
+**Bootstrapping the master** is a maintenance act, not an RPC:
+`--assign-overall PRINCIPAL --maintainer WHO` assigns OVERALL_COMMAND by procedure at boot, **only
+when nobody holds it**.
+- The same principal again changes nothing.
+- Anyone else holding it makes the manager **refuse to start**. A flag left in a compose file would
+  otherwise re-assign its principal on every restart, silently undoing a succession: the stale
+  master coming back that the revision exists to stop (I7). Ted and I reviewed this on 2026-11-04.
+- It is refused for a process.
+- It is audited as `bootstrap_overall` with the maintainer.
+
+Every later change of master goes through a grant or `assume_command`.
 
 ## Developing before the build
 

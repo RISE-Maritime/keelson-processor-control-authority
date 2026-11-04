@@ -66,7 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--heartbeat-s", type=int, default=5, help="command_assignment heartbeat (default 5 s)")
     p.add_argument("--feed-ttl-s", type=int, default=15, help="feed_ttl_seconds stated on the feed (default 15 s)")
     p.add_argument("--assign-overall", metavar="PRINCIPAL",
-                   help="MAINTENANCE: assign OVERALL_COMMAND to PRINCIPAL by procedure, once, at boot (audited)")
+                   help="MAINTENANCE: bootstrap OVERALL_COMMAND to PRINCIPAL when nobody holds it (audited; needs --maintainer)")
+    p.add_argument("--maintainer", metavar="WHO", help="who performs a maintenance act, recorded in the audit")
     return p
 
 
@@ -116,9 +117,10 @@ def main() -> int:
             # The one way to bootstrap the master over the wire is not over the wire: a maintenance act at
             # boot, like the supervisor's --accept-policy. Audited as `assign ... by procedure`; refused for
             # software; nothing when that principal already holds it.
-            d = manager.assign(model.OVERALL, args.assign_overall, "procedure")
+            d = manager.bootstrap_overall(args.assign_overall, args.maintainer or "")
             if d.outcome != model.ACCEPTED:
                 log.error("refusing to start: --assign-overall %s: %s", args.assign_overall, d.detail)
+                manager.store.close()
                 return 2
             a = manager.state.overall
             log.warning("MAINTENANCE: OVERALL_COMMAND is %s (assignment %s, revision %d)%s", a.assignee, a.assignment_id,
