@@ -131,7 +131,8 @@ class Harness:
         policy.write_text(json.dumps({"command_profile": "test", "dofs": DOFS, "lease_ttl_ms": {"conn": 30000}}))
         self.proc = subprocess.Popen(
             [sys.executable, str(ROOT / "bin/authority-manager2keelson.py"), "-r", REALM, "-e", V, "--zenoh-config", str(zcfg),
-             "--state-dir", str(self.tmp / "state"), "--policy", str(policy), "--heartbeat-s", "1", "--gate-timeout-s", "1"],
+             "--state-dir", str(self.tmp / "state"), "--policy", str(policy), "--heartbeat-s", "1", "--gate-timeout-s", "1",
+             *getattr(self, "start_args", [])],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
         token = keelson.construct_source_liveliness_key(REALM, V, "authority-manager")
@@ -231,3 +232,27 @@ def test_a_restart_reconciles_toward_a_gate_that_fenced_alone(h):
     h.wait(lambda: h.alarms, what="the disagreement alarm")
     hist = h.call("history", pb.HistoryRequest(), pb.HistoryReply)
     assert "reconcile_disagreement" in [r.event for r in hist.records]
+
+
+def test_the_master_is_bootstrapped_by_a_maintenance_flag_once(h):
+    h.gate.serve()
+    h.start_args = ["--assign-overall", "ted@ROC-1"]
+    h.start()
+    st = h.call("get", pb.GetAuthorityRequest(), pb.AuthorityState)
+    assert st.assignments.overall.assignee == "ted@ROC-1" and st.assignments.overall.revision == 1
+    h.stop_proc()
+    h.start()  # same flag again: already assigned, the revision does not move
+    st = h.call("get", pb.GetAuthorityRequest(), pb.AuthorityState)
+    assert st.assignments.overall.revision == 1
+    hist = h.call("history", pb.HistoryRequest(), pb.HistoryReply)
+    assert [r.event for r in hist.records].count("assign") == 1
+
+
+def test_a_process_is_never_bootstrapped_as_master(h, tmp_path):
+    policy = tmp_path / "p.json"
+    policy.write_text(json.dumps({"command_profile": "test", "dofs": DOFS, "processes": ["navigation/0@testvessel"]}))
+    p = subprocess.run([sys.executable, str(ROOT / "bin/authority-manager2keelson.py"), "-r", REALM, "-e", V,
+                        "--state-dir", str(tmp_path / "s"), "--policy", str(policy), "--assign-overall", "navigation/0@testvessel",
+                        "--mode", "peer", "--connect", f"tcp/127.0.0.1:{h.port}", "--gate-timeout-s", "0.5"],
+                       capture_output=True, text=True, timeout=30, check=False)
+    assert p.returncode == 2 and "never software" in (p.stdout + p.stderr)

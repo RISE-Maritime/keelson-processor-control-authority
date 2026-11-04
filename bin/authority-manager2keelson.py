@@ -65,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--policy", type=pathlib.Path, required=True, help="The vessel's control matrix and timings (JSON)")
     p.add_argument("--heartbeat-s", type=int, default=5, help="command_assignment heartbeat (default 5 s)")
     p.add_argument("--feed-ttl-s", type=int, default=15, help="feed_ttl_seconds stated on the feed (default 15 s)")
+    p.add_argument("--assign-overall", metavar="PRINCIPAL",
+                   help="MAINTENANCE: assign OVERALL_COMMAND to PRINCIPAL by procedure, once, at boot (audited)")
     return p
 
 
@@ -110,6 +112,17 @@ def main() -> int:
         manager.boot()
         log.info("booted: %s, %d lease(s), fence %s", "reconciled" if manager.state.reconciled else "NOT reconciled (gate silent)",
                  len(manager.state.leases), manager.state.in_force.fence)
+        if args.assign_overall:
+            # The one way to bootstrap the master over the wire is not over the wire: a maintenance act at
+            # boot, like the supervisor's --accept-policy. Audited as `assign ... by procedure`; refused for
+            # software; nothing when that principal already holds it.
+            d = manager.assign(model.OVERALL, args.assign_overall, "procedure")
+            if d.outcome != model.ACCEPTED:
+                log.error("refusing to start: --assign-overall %s: %s", args.assign_overall, d.detail)
+                return 2
+            a = manager.state.overall
+            log.warning("MAINTENANCE: OVERALL_COMMAND is %s (assignment %s, revision %d)%s", a.assignee, a.assignment_id,
+                        a.revision, f" — {d.detail}" if d.detail else "")
         # Every record is republished at boot, so a late joiner and the router's storage agree with the store.
         for slot in manager.state.leases:
             publish(model.PublishLease(slot), manager.state)

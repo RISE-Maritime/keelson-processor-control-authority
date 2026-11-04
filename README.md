@@ -85,6 +85,11 @@ authority-manager2keelson -r rise -e <vessel> --state-dir ./state --policy confi
   --gate-responder-id control-gate --connect tcp/<router>:7447
 ```
 
+**Bootstrapping the master** is a maintenance act, not an RPC: `--assign-overall PRINCIPAL` assigns
+OVERALL_COMMAND by procedure, once, at boot. It is audited as `assign … by procedure`, refused for a
+process, and changes nothing when that principal already holds it. Every later change of master goes
+through a grant or `assume_command`.
+
 ## Developing before the build
 
 The pin is an experimental build that carries both #331 and the interfaces branch. That build
