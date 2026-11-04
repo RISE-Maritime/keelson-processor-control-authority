@@ -1,0 +1,11 @@
+{
+  "command_profile": "test",
+  "dofs": ["rudder", "throttle_port", "throttle_stbd", "bow_thruster"],
+  "groups": {"throttles": ["throttle_port", "throttle_stbd"]},
+  "automation_sources": ["navigation/0"],
+  "processes": ["navigation/0@usv-alpha"],
+  "lease_ttl_ms": {"conn": 2000, "engineer": 60000, "payload": 5000},
+  "session_ttl_ms": 30000,
+  "prepare_ttl_ms": 2000,
+  "succession": {"overall": ["chief-officer@ROC-1"], "navigational": "*"}
+}

@@ -1,0 +1,96 @@
+# keelson-processor-control-authority
+
+The onboard **authority manager**, one per vessel. It owns the role leases, the OVERALL and
+NAVIGATIONAL_COMMAND assignments and their sessions, the navigation authority document,
+`active_control_station`, and the two-phase motion transfer with the control gate. It **proposes a
+transfer, never a fence**: the gate validates it against what it is emitting now, reserves `(T, n+1)`
+and ACKs with it, and only a COMMIT that the manager has already written to its own store activates.
+
+- **Protocol:** keelson `protocols/command_authority.yaml`, `CommandAuthority.proto`,
+  `ControlMapping.proto` and `NavigationAuthority.proto` (keelson PR #331).
+- **Design:** crowsnest-dev `docs/COMMAND-ARCHITECTURE.md` §0, §4 and §5. The work item is crowsnest-dev #84.
+- **Replaces** `keelson-processor-supervisor`'s `authority.py` (`open` / `exclusive`, single station).
+
+> **Status: the core only. It talks to no network.** The decisions, the store and the sequence are
+> built and tested against a **fake gate**. The Zenoh wiring waits for two interfaces that keelson
+> does not have yet (`command_authority` `not_solved`, "The manager and the gate as interfaces"):
+> the manager's own control-plane surface (`request / renew / release / transfer / take_control /
+> abort_automation / assume_command / get / history`) and the gate's `control_gate` class
+> (`prepare / commit / reconcile / abort_automation_direct`). They are written as a keelson PR stacked
+> on #331, after this core. Never run this against a real vessel or a shared network.
+
+## What it does
+
+- **Every conn change is a motion transfer.** Taking a free conn, a grant between humans, Take
+  control from automation and a station handover all go through `PREPARE → ACK → COMMIT`. A
+  release proposes nothing: the mapping's holder lease is gone, and the gate withdraws into its
+  transition state on its own.
+- **Durable on both sides (I13).** PREPARED is committed before the gate hears the proposal, and
+  COMMITTED(map, station, fence) before it hears the COMMIT. Each new state commits together with
+  its audit records in one sqlite transaction, and the effects run after it.
+- **Reconcile before any transfer.** Every boot starts unreconciled, and so does every COMMIT the
+  gate refused or left unanswered. Reading the gate's exposed `(fence, map, station)` resolves the
+  transfers in flight as follows:
+  - PREPARED is abandoned;
+  - COMMITTED whose fence the gate shows is active;
+  - any other COMMITTED is abandoned.
+
+  If the gate disagrees with the manager's record, the gate's state is adopted, and the
+  disagreement is audited and raised as an alarm. A restart mints nothing, and every lease gets a
+  fresh TTL on the new process's clock, so a healthy conn is never interrupted.
+- **All or nothing (I10).** A transfer moves the whole helm at one station: every DOF and every
+  coupled group, with human sources at the active control station. The manager checks the shape,
+  the lease, the role and the profile. **Neutral-or-match is the gate's final word**, and one
+  unmatched lever NAKs the whole transfer.
+- **The revision revokes (I7).** Every privileged request (take control, abort automation, a station
+  handover, an assignment, a navigation-document change) must pass all three of these:
+  - the requester is the assignee;
+  - the request carries the current `assignment_revision`;
+  - it comes with a live session of that assignment.
+
+  `assume_command` records a succession for an assignee whose session has lapsed, under the
+  vessel's succession policy and with a reason and evidence. It increments the revision, so the
+  old master's stale grants are refused. It touches no lease, no map and no fence.
+- **Never software:** OVERALL and NAVIGATIONAL_COMMAND are never assigned to a process.
+- **`legacy_single_operator`:** the two assignments are synthesised for the conn holder and marked
+  `synthesised`.
+- **Who may take the conn:**
+  - `operational`: only once the master has set a station;
+  - `test`: the first taker's station becomes the active control station.
+- **Revisions it mints:** `Assignment.revision` and `NavigationAuthority.revision` are the only
+  ones. The motion fence is the gate's. `plant_generation` and `payload_epoch` are their gates' too:
+  Ted decided that the motion gate mints `plant_generation` in both halves, which supersedes the
+  older wording in #84.
+- **No `force_safety_release` anywhere:** the manager is not the supervisor.
+
+**A lost store.** A store that fails its integrity check, its schema or its hash is refused, and the
+service does not start. Unlike the safety supervisor, there is no "more inhibited" state to fall
+back to that would be safe here: who holds which role is not a thing to guess. The procedure for
+re-initialising a store, which would reconcile everything from the gate, is not written yet.
+
+## Developing before the build
+
+The pin is the experimental build that carries #331, still to be cut. Until it exists, `uv sync`
+cannot resolve it. In the meantime, develop against the #331 worktree's SDK **without committing
+that**:
+
+```bash
+uv venv --python 3.13 .venv
+uv pip install --python .venv/bin/python -e ../keelson.worktrees/command-roles/sdks/python pytest==8.3.4 ruff==0.14.11
+.venv/bin/python -m pytest -q
+.venv/bin/ruff check .
+```
+
+When the build exists: set its exact version in `pyproject.toml`, run `uv lock`, and use
+`uv sync --locked --extra dev`.
+
+## Not in this cut
+
+- The Zenoh wiring, the CLI and the Dockerfile; they wait for the interfaces.
+- The audit-record publication.
+- The ENGINEER and PAYLOAD_AUTHORITY holder changes as gate transfers: today they are plain
+  leases. Those transfers need the inherited constraint snapshot and the plant and payload gates.
+- Fencing NAVIGATION_AUTHORITY on take-control and abort. The CONN is fenced; what happens to the
+  automation's function assignments is not specified yet.
+- During migration, compiling the map into `vehicle_control/v1 set_control_mapping`.
+- The principal binding (`controller_id` to an authenticated principal).

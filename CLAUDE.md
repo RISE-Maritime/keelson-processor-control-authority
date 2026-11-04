@@ -1,0 +1,26 @@
+# CLAUDE.md
+
+The onboard authority manager (README). **Safety-critical: every change is reviewed by a human before
+it is merged or run anywhere but the isolated tests.** Every commit message carries a
+`Safety-review: required` trailer naming what changed.
+
+## Rules that must not be broken
+
+- **It never mints a motion fence.** It proposes; the gate reserves and ACKs; the manager records
+  COMMITTED before it sends COMMIT. No code path builds a `Fence` from the manager's own numbers.
+- **Durable before effective.** A decision's state and audit commit in one transaction; gate calls
+  and publications run after it (service.py). Never send first and record later.
+- **Reconcile before any transfer**, toward the gate. A restart interrupts no healthy holder and mints
+  nothing.
+- **Pure decisions.** `control_authority/model.py` has no clock, no store and no Zenoh; every
+  decision is tested there or through service.py against `tests/fakegate.py`.
+- **Tests never touch a network**, and nothing runs against a vessel or the shared Zenoh network.
+- **keelson is an exact published pin** (README, "Developing before the build"). Never commit a path
+  or a local build.
+
+## Commands
+
+```bash
+.venv/bin/python -m pytest -q
+.venv/bin/ruff check .
+```

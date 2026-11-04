@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keelson-processor-control-authority"
+version = "0.1.0"
+description = "The onboard authority manager: role leases, assignments, the navigation authority document and the two-phase motion transfer with the control gate (keelson protocols/command_authority.yaml)."
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    # EXACT pin, never a path or a range. The types (role leases, CommandAssignment, ControlMapping,
+    # TransferPrepare/Ack/Commit, Fence) exist only on keelson PR #331; this is the experimental build
+    # that carries it, tracked by crowsnest-dev #84. Repin to the release that carries #331 when it merges.
+    # PENDING: the build has not been cut yet; until it is, develop against the #331 worktree's SDK in a
+    # local venv (README, "Developing before the build").
+    "keelson==0.6.0.dev21",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.4", "ruff==0.14.11"]
+
+[tool.setuptools]
+packages = ["control_authority"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 140
