@@ -49,6 +49,18 @@ and ACKs with it, and only a COMMIT that the manager has already written to its 
   `assume_command` records a succession for an assignee whose session has lapsed, under the
   vessel's succession policy and with a reason and evidence. It increments the revision, so the
   old master's stale grants are refused. It touches no lease, no map and no fence.
+- **Take control and Abort take back the delegation** (crowsnest-dev#271, decided by Ted on
+  2026-11-05). When either becomes active, every navigation function a process holds reverts to the
+  human who acted, at method 2 (Directed).
+  - **Durable together:** it happens in the same decision as the CONN, map and station, with one
+    `NavigationAuthority.revision` bump and an audit `navigation_reverted`.
+  - **What changes:** a human's functions are untouched, the envelope is kept, and re-delegating is
+    a new grant.
+  - **Why:** the CONN fence alone leaves the delegation in the document. It would become executable
+    again through a later carry-out envelope. The revision bump also refuses a stale `NAV_FUNCTION`
+    candidate on the DECISION check.
+  - **Not yet covered:** an abort the gate performs alone, while the manager is down, is not
+    recognised at reconcile yet (crowsnest-dev#290).
 - **Never software:** OVERALL and NAVIGATIONAL_COMMAND are never assigned to a process.
 - **`legacy_single_operator`:** the two assignments are synthesised for the conn holder and marked
   `synthesised`.

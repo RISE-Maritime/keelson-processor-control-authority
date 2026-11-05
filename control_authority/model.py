@@ -158,6 +158,10 @@ class Transfer:
     conn_site: str = ""
     conn_token: str = ""
     conn_lease_id: str = ""
+    # TAKE_CONTROL / ABORT_AUTOMATION: who takes back the navigator's navigation functions on
+    # activation, and the session lease that proves them present (crowsnest-dev#271).
+    reverts_to: str = ""
+    reverts_lease_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -607,9 +611,13 @@ def begin_transfer(state: State, policy: Policy, req: TransferRequest, now_ms: i
             return _same(state, REFUSED_MAP, "; ".join(problems))
 
     tid = transfer_id or new_id()
+    # Take control and Abort take back what the automation holds (_revert_navigation): the acting
+    # human, under the session lease authorise_privileged just checked (a session's lease id is its token).
+    takes_back = req.kind in (TAKE_CONTROL, ABORT_AUTOMATION)
     t = Transfer(tid, req.kind, mappings, station, req.requester, req.reason, PREPARED,
                  conn_holder=conn_holder, conn_site=conn_site, conn_token=conn_token,
-                 conn_lease_id=lease_id)
+                 conn_lease_id=lease_id,
+                 reverts_to=req.requester if takes_back else "", reverts_lease_id=req.session_token if takes_back else "")
     st = replace(state, transfers={**state.transfers, tid: t})
     return Decision(st, PENDING, "", (GatePrepare(t, policy.prepare_ttl_ms),),
                     (_audit("prepared", transfer_id=tid, kind=req.kind, by=req.requester, station=station,
@@ -666,9 +674,38 @@ def _activate(state: State, policy: Policy, t: Transfer, now_ms: int, how: str) 
     nt = replace(t, phase=ACTIVE)
     st = replace(state, leases=leases, transfers={**state.transfers, t.transfer_id: nt},
                  in_force=InForce(mappings, t.station, fence), active_station=t.station)
-    return Decision(st, ACCEPTED, "", tuple(effects),
-                    (_audit(how, transfer_id=t.transfer_id, kind=t.kind, station=t.station, fence=_fence_json(fence),
-                            new_map=_map_json(mappings)),), t.transfer_id)
+    audits = [_audit(how, transfer_id=t.transfer_id, kind=t.kind, station=t.station, fence=_fence_json(fence),
+                     new_map=_map_json(mappings))]
+    if t.kind in (TAKE_CONTROL, ABORT_AUTOMATION):
+        st, reverted = _revert_navigation(st, policy, t)
+        if reverted:
+            effects.append(PublishNavigation())
+            audits.append(_audit("navigation_reverted", transfer_id=t.transfer_id, kind=t.kind, functions=reverted,
+                                 to=t.reverts_to, revision=st.navigation_revision))
+    return Decision(st, ACCEPTED, "", tuple(effects), tuple(audits), t.transfer_id)
+
+
+def _revert_navigation(state: State, policy: Policy, t: Transfer) -> tuple[State, list[str]]:
+    """TAKE CONTROL AND ABORT TAKE BACK THE DELEGATION (crowsnest-dev#271, decided by Ted on 2026-11-05;
+    COMMAND-ARCHITECTURE §4.1). Every navigation function a software principal holds reverts to the
+    human who acted, at method 2 (Directed: the navigator advises, and carries out only on order), in
+    the SAME decision that activates the CONN, map and epoch, so the two are durable together.
+
+    Why: the CONN fence already stops the navigator's motion, but a delegation left in the document
+    outlives the take-over -- it becomes executable again the moment the human pre-authorises a
+    carry-out envelope, and the HMI shows automation holding functions it no longer exercises. The
+    revision bump is a second, independent fence: a NAV_FUNCTION candidate under the old revision is
+    refused on the DECISION check whatever its execution basis (I15). Re-delegating is a new grant.
+
+    The envelope is kept, so a re-delegation can restore it; at method 2 it grants nothing.
+    Functions held by humans are untouched. Returns the new state and the functions reverted."""
+    reverted = sorted(f for f, fn in state.navigation.items() if policy.is_software(fn.holder))
+    if not reverted:
+        return state, []
+    nav = dict(state.navigation)
+    for f in reverted:
+        nav[f] = NavFunction(t.reverts_to, t.reverts_lease_id, 2, dict(nav[f].envelope))
+    return replace(state, navigation=nav, navigation_revision=state.navigation_revision + 1), reverted
 
 
 def abandon(state: State, transfer_id: str, why: str) -> Decision:

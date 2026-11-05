@@ -354,6 +354,119 @@ def test_abort_automation_fences_the_navigator_and_proposes_no_map(tmp_path, clo
     assert model.CONN not in m.state.leases and m.state.in_force.mappings == () and m.state.in_force.fence == gate.fence
 
 
+
+# ---------------------------------------------------------------------------- crowsnest-dev#271: the delegation is taken back
+
+
+def _delegated(m, nav):
+    """The navigator holds collision_avoidance at 3 and track_keeping at 4; a human holds
+    route_modification at 2. Returns the document's revision after the three writes."""
+    for function, fn in (("collision_avoidance", NavFunction(NAV, "nav-live", 3, {"colreg_auto_accept_level": 2})),
+                         ("track_keeping", NavFunction(NAV, "nav-live", 4, {"reroute_allowed": False})),
+                         ("route_modification", NavFunction("anna@ROC-2", "sess-2", 2))):
+        assert m.set_navigation_function(function, fn, "anna@ROC-2", nav.revision, "sess-2").outcome == model.ACCEPTED
+    return m.state.navigation_revision
+
+
+def _setup_automation(tmp_path, clock, gate, bus=None):
+    m = make(tmp_path, clock, gate, bus=bus)
+    master(m, "ted@ROC-1", "ROC-1")
+    nav = master(m, "anna@ROC-2", "ROC-2", model.NAVIGATIONAL, token="sess-2")
+    take_conn(m, "ted@ROC-1", "ROC-1")
+    rev = _delegated(m, nav)
+    _automation_holds_the_conn(m)
+    return m, nav, rev
+
+
+def _assert_taken_back(m, rev, by="anna@ROC-2", lease="sess-2"):
+    nav = m.state.navigation
+    assert nav["collision_avoidance"] == NavFunction(by, lease, 2, {"colreg_auto_accept_level": 2})
+    assert nav["track_keeping"] == NavFunction(by, lease, 2, {"reroute_allowed": False})
+    assert nav["route_modification"] == NavFunction("anna@ROC-2", "sess-2", 2)  # a human's: untouched
+    assert m.state.navigation_revision == rev + 1  # one change, one revision, with the activation
+    audit = [r for r in m.history() if r["event"] == "navigation_reverted"]
+    assert len(audit) == 1 and audit[0]["functions"] == ["collision_avoidance", "track_keeping"]
+    assert audit[0]["to"] == by and audit[0]["revision"] == rev + 1
+
+
+def test_take_control_takes_back_every_function_the_navigator_holds_at_method_2(tmp_path, clock, gate):
+    bus = Bus()
+    m, nav, rev = _setup_automation(tmp_path, clock, gate, bus)
+    published = len([e for e in bus.effects if isinstance(e, model.PublishNavigation)])
+    d = m.transfer(TransferRequest(model.TAKE_CONTROL, "anna@ROC-2", "ROC-2", assignment_revision=nav.revision,
+                                   session_token="sess-2", mappings=human_map("ROC-2")))
+    assert d.outcome == model.ACCEPTED, d.detail
+    _assert_taken_back(m, rev)
+    assert len([e for e in bus.effects if isinstance(e, model.PublishNavigation)]) == published + 1
+
+
+def test_abort_automation_takes_back_the_functions_too(tmp_path, clock, gate):
+    m, nav, rev = _setup_automation(tmp_path, clock, gate)
+    d = m.transfer(TransferRequest(model.ABORT_AUTOMATION, "anna@ROC-2", "ROC-2", assignment_revision=nav.revision,
+                                   session_token="sess-2"))
+    assert d.outcome == model.ACCEPTED, d.detail
+    assert model.CONN not in m.state.leases
+    _assert_taken_back(m, rev)
+
+
+def test_nothing_delegated_nothing_reverted_and_no_revision(tmp_path, clock, gate):
+    bus = Bus()
+    m = make(tmp_path, clock, gate, bus=bus)
+    master(m, "ted@ROC-1", "ROC-1")
+    nav = master(m, "anna@ROC-2", "ROC-2", model.NAVIGATIONAL, token="sess-2")
+    take_conn(m, "ted@ROC-1", "ROC-1")
+    m.set_navigation_function("route_modification", NavFunction("anna@ROC-2", "sess-2", 2), "anna@ROC-2", nav.revision, "sess-2")
+    rev = m.state.navigation_revision
+    _automation_holds_the_conn(m)
+    published = len([e for e in bus.effects if isinstance(e, model.PublishNavigation)])
+    assert m.transfer(TransferRequest(model.TAKE_CONTROL, "anna@ROC-2", "ROC-2", assignment_revision=nav.revision,
+                                      session_token="sess-2", mappings=human_map("ROC-2"))).outcome == model.ACCEPTED
+    assert m.state.navigation_revision == rev
+    assert len([e for e in bus.effects if isinstance(e, model.PublishNavigation)]) == published
+    assert not [r for r in m.history() if r["event"] == "navigation_reverted"]
+
+
+def test_a_refused_take_control_reverts_nothing(tmp_path, clock, gate):
+    m, nav, rev = _setup_automation(tmp_path, clock, gate)
+    before = dict(m.state.navigation)
+    req = TransferRequest(model.TAKE_CONTROL, "anna@ROC-2", "ROC-2", assignment_revision=nav.revision,
+                          session_token="sess-2", mappings=human_map("ROC-2"))
+    gate.unready = {"rudder"}  # the gate NAKs the PREPARE: not neutral or matched
+    assert m.transfer(req).outcome == model.REFUSED_BY_GATE
+    assert m.state.navigation == before and m.state.navigation_revision == rev
+    gate.unready = set()
+    gate.on_commit = lambda tid: gate.restart()  # ACKed, then the COMMIT is refused
+    assert m.transfer(req).outcome == model.REFUSED_BY_GATE
+    assert m.state.navigation == before and m.state.navigation_revision == rev
+    assert m.state.leases[model.CONN].holder == NAV  # and the automation still has the conn it had
+
+
+def test_a_take_control_activated_on_reconcile_reverts_as_well(tmp_path, clock, gate):
+    m, nav, rev = _setup_automation(tmp_path, clock, gate)
+    d = model.begin_transfer(m.state, POLICY, TransferRequest(model.TAKE_CONTROL, "anna@ROC-2", "ROC-2",
+                                                              assignment_revision=nav.revision, session_token="sess-2",
+                                                              mappings=human_map("ROC-2")), clock())
+    ack = gate.prepare(d.effects[0].transfer, 2000)
+    d2 = model.on_ack(d.state, d.transfer_id, ack.accepted, ack.fence)
+    m.store.commit(d2.state, d2.audits)
+    assert gate.commit(d.transfer_id, ack.fence)[0]  # the gate activated it; the manager died first
+    m.store.close()
+    m2 = make(tmp_path, clock, gate)
+    assert m2.state.transfers[d.transfer_id].phase == model.ACTIVE
+    _assert_taken_back(m2, rev)
+
+
+def test_handing_the_conn_to_the_navigator_reverts_nothing(tmp_path, clock, gate):
+    m = make(tmp_path, clock, gate)
+    master(m, "ted@ROC-1", "ROC-1")
+    nav = master(m, "anna@ROC-2", "ROC-2", model.NAVIGATIONAL, token="sess-2")
+    take_conn(m, "ted@ROC-1", "ROC-1")
+    rev = _delegated(m, nav)
+    before = dict(m.state.navigation)
+    _automation_holds_the_conn(m)  # a GRANT
+    assert m.state.navigation == before and m.state.navigation_revision == rev
+
+
 def test_station_handover_is_the_masters_and_moves_every_dof(tmp_path, clock, gate):
     m = make(tmp_path, clock, gate)
     a = master(m)
