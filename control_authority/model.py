@@ -108,6 +108,9 @@ class Lease:
     renewed_ms: int
     ttl_ms: int
     assignment_id: str = ""  # a session names the assignment it belongs to
+    # Who really took or last renewed it, as the ROC service attested (attestation.py); {} when
+    # the call carried no attestation (crowsnest-dev#312).
+    principal: dict = field(default_factory=dict)
 
     def live(self, now_ms: int) -> bool:
         return now_ms - self.renewed_ms <= self.ttl_ms
@@ -175,6 +178,8 @@ class Transfer:
     # activation, and the session lease that proves them present (crowsnest-dev#271).
     reverts_to: str = ""
     reverts_lease_id: str = ""
+    # Who asked for it, as attested; {} without an attestation (crowsnest-dev#312).
+    principal: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -365,6 +370,11 @@ class Policy:
     # role -> principals allowed to ASSUME it, or "*" for any human
     succession: dict = field(default_factory=dict)
     maintenance: MaintenancePolicy = field(default_factory=MaintenancePolicy)
+    # The ROC services this vessel trusts to attest who is acting (attestation.py): key_id ->
+    # TrustedKey. Safety-relevant configuration: it changes only in maintenance.
+    attestation_keys: dict = field(default_factory=dict)
+    attestation_required: bool = False  # default: command_profile == "operational" (policy.py)
+    challenge_ttl_ms: int = 15000
 
     def ttl(self, role: str) -> int:
         return int(self.lease_ttl_ms.get(role, 30000))

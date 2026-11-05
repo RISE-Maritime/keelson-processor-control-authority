@@ -27,7 +27,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Protocol
 
-from . import model
+from . import attestation, model
 from .model import Decision, Fence, Mapping, Policy, State, Transfer, TransferRequest
 
 log = logging.getLogger(__name__)
@@ -77,6 +77,12 @@ class Manager:
         # What the maintenance guards read, on local receipt. Never persisted (model.Heard).
         self.heard = model.Heard()
         self._published_guards: tuple | None = None
+        # Attestation (crowsnest-dev#312): the challenges we issued and the sequences accepted,
+        # volatile -- after a restart every attestation from before it is stale. `principal` is who
+        # the RPC being decided was attested as, set by rpc.Handlers under the lock.
+        self.challenges = attestation.Challenges(policy.challenge_ttl_ms)
+        self.seen: dict = {}
+        self.principal: dict | None = None
 
     # ------------------------------------------------------------------ boot
 
@@ -91,6 +97,7 @@ class Manager:
         st = model.rebase_after_restart(st, now)
         self.store.commit(st, ({"event": "boot", "restored": stored is not None},), self.audit_ms())
         self.state = st
+        self.challenges.rotate(now)
         self.reconcile()
         return self.state
 
@@ -208,6 +215,7 @@ class Manager:
             self._publish_maintenance()
 
     def heartbeat(self) -> None:
+        self.challenges.rotate(self.now_ms())
         self._publish(model.PublishAssignments(), self.state)
         self._publish_maintenance()
 
@@ -221,8 +229,26 @@ class Manager:
 
     # ------------------------------------------------------------------ internals
 
+    def verify(self, attestation_pb, request, procedure: str):
+        return attestation.verify(attestation_pb, request, procedure, self.policy.attestation_keys,
+                                  self.challenges, self.seen, self.now_ms())
+
+    def _stamp(self, d: Decision) -> Decision:
+        """Put the attested principal on every lease and transfer this call created or changed, and
+        on its audit records. A call with no attestation stamps nothing."""
+        who = self.principal
+        if not who:
+            return d
+        leases = {s: (replace(lease, principal=who) if self.state.leases.get(s) != lease else lease)
+                  for s, lease in d.state.leases.items()}
+        transfers = {t: (replace(x, principal=who) if self.state.transfers.get(t) != x else x)
+                     for t, x in d.state.transfers.items()}
+        st = replace(d.state, leases=leases, transfers=transfers)
+        return replace(d, state=st, audits=tuple({**a, "principal": who} for a in d.audits))
+
     def _apply(self, d: Decision) -> Decision:
         """Commit, then run the non-gate effects. Gate effects are run by _follow, in order."""
+        d = self._stamp(d)
         if d.state is not self.state or d.audits:
             self.store.commit(d.state, d.audits, self.audit_ms())
         self.state = d.state

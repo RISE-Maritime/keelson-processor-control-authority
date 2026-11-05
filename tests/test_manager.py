@@ -192,7 +192,9 @@ def test_between_humans_only_the_holder_grants_and_only_within_the_station(tmp_p
 
 
 def test_operational_profile_has_no_station_until_the_master_sets_one(tmp_path, clock, gate):
-    op = parse({"command_profile": "operational", "dofs": DOFS, "groups": {"throttles": ["throttle_port", "throttle_stbd"]}})
+    # Attestation is its own test (test_attestation.py); here the station rule alone.
+    op = parse({"command_profile": "operational", "dofs": DOFS, "groups": {"throttles": ["throttle_port", "throttle_stbd"]},
+                "attestation": {"required": False}})
     m = make(tmp_path, clock, gate, policy=op)
     assert take_conn(m).outcome == model.REFUSED_UNAUTHORISED
 

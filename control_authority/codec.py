@@ -126,10 +126,12 @@ def lease_record(st: State, slot: str, issuer_id: str, released: bool = False, n
 
 
 def assignment_feed(st: State, issuer_id: str, heartbeat_interval_seconds: int, feed_ttl_seconds: int,
-                    now: Timestamp | None = None) -> CommandAssignment:
-    """`command_assignment/{vessel}`: the manager is its one writer."""
+                    now: Timestamp | None = None, challenge: bytes = b"") -> CommandAssignment:
+    """`command_assignment/{vessel}`: the manager is its one writer. It carries the newest
+    attestation challenge (crowsnest-dev#312)."""
     feed = CommandAssignment(vessel_id=st.vessel_id, issuer_id=issuer_id,
-                             heartbeat_interval_seconds=heartbeat_interval_seconds, feed_ttl_seconds=feed_ttl_seconds)
+                             heartbeat_interval_seconds=heartbeat_interval_seconds, feed_ttl_seconds=feed_ttl_seconds,
+                             attestation_challenge=challenge)
     if st.overall is not None:
         feed.overall.CopyFrom(_assignment_to_proto(st.overall))
     if st.navigational is not None:
@@ -252,13 +254,16 @@ def resolved_from_proto(rc) -> dict:
     }
 
 
-def authority_state(st: State, issuer_id: str, heartbeat_interval_seconds: int, feed_ttl_seconds: int, guards=()):
+def authority_state(st: State, issuer_id: str, heartbeat_interval_seconds: int, feed_ttl_seconds: int, guards=(),
+                    challenges=()):
     from keelson.interfaces.AuthorityManager_pb2 import AuthorityState
 
     out = AuthorityState(vessel_id=st.vessel_id, active_control_station=st.active_station, reconciled=st.reconciled,
                          records=[lease_record(st, slot, issuer_id) for slot in sorted(st.leases)],
                          mappings=[mapping_to_proto(m, st.in_force.fence) for m in st.in_force.mappings])
-    out.assignments.CopyFrom(assignment_feed(st, issuer_id, heartbeat_interval_seconds, feed_ttl_seconds))
+    out.assignments.CopyFrom(assignment_feed(st, issuer_id, heartbeat_interval_seconds, feed_ttl_seconds,
+                                             challenge=challenges[0] if challenges else b""))
+    out.attestation_challenges.extend(challenges)
     out.navigation.CopyFrom(navigation_document(st))
     if st.in_force.fence is not None:
         out.fence.CopyFrom(fence_to_proto(st.in_force.fence))

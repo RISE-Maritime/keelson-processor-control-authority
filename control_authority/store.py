@@ -89,7 +89,7 @@ def _maintenance(d):
 def state_from_json(d: dict) -> State:
     return State(
         vessel_id=d["vessel_id"],
-        leases={k: Lease(**v) for k, v in d["leases"].items()},
+        leases={k: Lease(**{**v, "principal": dict(v.get("principal") or {})}) for k, v in d["leases"].items()},
         overall=_assignment(d["overall"]),
         navigational=_assignment(d["navigational"]),
         navigation={k: NavFunction(v["holder"], v["holder_lease_id"], int(v["method"]), dict(v.get("envelope") or {}))
@@ -99,7 +99,8 @@ def state_from_json(d: dict) -> State:
         responsible_roc=d["responsible_roc"],
         in_force=InForce(tuple(_mapping(m) for m in d["in_force"]["mappings"]), d["in_force"]["station"],
                          _fence(d["in_force"]["fence"])),
-        transfers={k: Transfer(**{**v, "mappings": tuple(_mapping(m) for m in v["mappings"]), "fence": _fence(v["fence"])})
+        transfers={k: Transfer(**{**v, "mappings": tuple(_mapping(m) for m in v["mappings"]), "fence": _fence(v["fence"]),
+                                  "principal": dict(v.get("principal") or {})})
                    for k, v in d["transfers"].items()},
         maintenance=_maintenance(d.get("maintenance")),
         reconciled=False,

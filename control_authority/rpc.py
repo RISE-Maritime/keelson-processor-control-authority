@@ -5,6 +5,12 @@ ONE LOCK DECIDES. zenoh-python runs each procedure's queryable on its own thread
 the same lock for the whole call -- a transfer's gate round trips included -- so the manager decides
 one request at a time, in arrival order, exactly as service.py requires. A transfer holds the lock
 for at most two gate calls, each bounded by the gate client's timeout.
+
+ATTESTED FIRST (crowsnest-dev#312). Every procedure that changes anything checks the caller's
+attestation under that same lock before the manager decides: a present attestation is always
+verified and a bad one always refused (REFUSAL_ATTESTATION, `detail` naming the check), and a
+missing one is refused where the policy requires it (operational, by default). An accepted one
+stamps its principal on what the call creates and on its audit records.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ from keelson.interfaces.AuthorityManager_pb2 import (
     Refusal,
     SetNavigationAuthorityReply,
 )
+from functools import wraps
 from keelson.interfaces.VehicleCommon_pb2 import CommandResult
 from keelson.payloads.CommandAuthority_pb2 import Role
 
@@ -68,13 +75,50 @@ def _denied(refusal: int, detail: str) -> AuthorityReply:
     return AuthorityReply(result=CommandResult.COMMAND_RESULT_DENIED, refusal=refusal, detail=detail)
 
 
+def attested(procedure: str, reply_cls):
+    """Check the call's attestation first, under the one lock (reentrant, so the handler's own
+    `with self.lock` still holds). The refusal is the procedure's own reply type."""
+
+    def deco(fn):
+        @wraps(fn)
+        def run(self, req):
+            with self.lock:
+                refused = self._attest(req, procedure, reply_cls)
+                if refused is not None:
+                    return refused
+                try:
+                    return fn(self, req)
+                finally:
+                    self.m.principal = None
+
+        return run
+
+    return deco
+
+
 class Handlers:
     def __init__(self, manager, issuer_id: str, heartbeat_interval_seconds: int, feed_ttl_seconds: int):
         self.m = manager
         self.issuer_id = issuer_id
         self.hb_s = heartbeat_interval_seconds
         self.feed_ttl_s = feed_ttl_seconds
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+
+    def _attest(self, req, procedure: str, reply_cls):
+        """None when the call may proceed (its principal on the manager), else the refusal."""
+        self.m.principal = None
+        caller = req.caller
+        if caller.HasField("attestation"):
+            v = self.m.verify(caller.attestation, req, procedure)
+            if not v.ok:
+                return reply_cls(result=CommandResult.COMMAND_RESULT_DENIED, refusal=Refusal.REFUSAL_ATTESTATION,
+                                 detail=v.outcome)
+            self.m.principal = v.principal
+            return None
+        if self.m.policy.attestation_required:
+            return reply_cls(result=CommandResult.COMMAND_RESULT_DENIED, refusal=Refusal.REFUSAL_ATTESTATION,
+                             detail="this vessel requires an attestation from a ROC service it trusts")
+        return None
 
     # ------------------------------------------------------------------ replies
 
@@ -91,6 +135,7 @@ class Handlers:
 
     # ------------------------------------------------------------------ procedures
 
+    @attested("request", AuthorityReply)
     def request(self, req) -> AuthorityReply:
         c = req.caller
         with self.lock:
@@ -104,6 +149,7 @@ class Handlers:
                 return self._reply(d, model.slot_of(role, req.payload_id))
         return _denied(Refusal.REFUSAL_MALFORMED, "an assignment changes by transfer or assume_command, never by request")
 
+    @attested("renew", AuthorityReply)
     def renew(self, req) -> AuthorityReply:
         c = req.caller
         with self.lock:
@@ -116,6 +162,7 @@ class Handlers:
                 return self._reply(d, model.session_slot(role))
         return _denied(Refusal.REFUSAL_MALFORMED, "not a lease or a session")
 
+    @attested("release", AuthorityReply)
     def release(self, req) -> AuthorityReply:
         c = req.caller
         with self.lock:
@@ -125,6 +172,7 @@ class Handlers:
                 return self._reply(self.m.release(model.session_slot(ASSIGNMENT_ROLE[req.role]), _token(c)))
         return _denied(Refusal.REFUSAL_MALFORMED, "not a lease or a session")
 
+    @attested("transfer", AuthorityReply)
     def transfer(self, req) -> AuthorityReply:
         c = req.caller
         with self.lock:
@@ -147,6 +195,7 @@ class Handlers:
                               detail="an ENGINEER or PAYLOAD_AUTHORITY handover needs its gate and the inherited "
                                      "constraint snapshot; not served yet — release and take instead")
 
+    @attested("take_control", AuthorityReply)
     def take_control(self, req) -> AuthorityReply:
         c = req.caller
         with self.lock:
@@ -155,6 +204,7 @@ class Handlers:
                                                 mappings=_rows(req.mappings)))
             return self._reply(d, model.CONN)
 
+    @attested("abort_automation", AuthorityReply)
     def abort_automation(self, req) -> AuthorityReply:
         c = req.caller
         with self.lock:
@@ -162,6 +212,7 @@ class Handlers:
                                                 assignment_revision=_revision(c), session_token=_token(c)))
             return self._reply(d)
 
+    @attested("assume_command", AssumeCommandReply)
     def assume_command(self, req) -> AssumeCommandReply:
         c = req.caller
         if req.role not in ASSIGNMENT_ROLE:
@@ -177,6 +228,7 @@ class Handlers:
                 out.assignment.CopyFrom(codec._assignment_to_proto(a))
             return out
 
+    @attested("set_navigation_authority", SetNavigationAuthorityReply)
     def set_navigation_authority(self, req) -> SetNavigationAuthorityReply:
         c = req.caller
         fn = codec.nav_function_from_proto(req.authority) if req.HasField("authority") else None
@@ -193,22 +245,26 @@ class Handlers:
         return MaintenanceReply(result=result, refusal=refusal, detail=d.detail,
                                 record=codec.maintenance_record(self.m.state, self.m.guards(), self.issuer_id))
 
+    @attested("request_maintenance", MaintenanceReply)
     def request_maintenance(self, req) -> MaintenanceReply:
         c = req.caller
         with self.lock:
             return self._maintenance_reply(self.m.request_maintenance(
                 c.controller_id, _revision(c), _token(c), req.maintainer, req.reason, codec.scopes_from_proto(req.scopes)))
 
+    @attested("cancel_maintenance", MaintenanceReply)
     def cancel_maintenance(self, req) -> MaintenanceReply:
         c = req.caller
         with self.lock:
             return self._maintenance_reply(self.m.cancel_maintenance(c.controller_id, _revision(c), _token(c), req.reason))
 
+    @attested("finish_maintenance", MaintenanceReply)
     def finish_maintenance(self, req) -> MaintenanceReply:
         c = req.caller
         with self.lock:
             return self._maintenance_reply(self.m.finish_maintenance(c.controller_id, _revision(c), _token(c), req.detail))
 
+    @attested("complete_maintenance_check", MaintenanceReply)
     def complete_maintenance_check(self, req) -> MaintenanceReply:
         c = req.caller
         with self.lock:
@@ -217,7 +273,8 @@ class Handlers:
 
     def get(self, req):
         with self.lock:
-            return codec.authority_state(self.m.state, self.issuer_id, self.hb_s, self.feed_ttl_s, self.m.guards())
+            return codec.authority_state(self.m.state, self.issuer_id, self.hb_s, self.feed_ttl_s, self.m.guards(),
+                                         self.m.challenges.live(self.m.now_ms()))
 
     def history(self, req) -> HistoryReply:
         limit = req.limit or 1000

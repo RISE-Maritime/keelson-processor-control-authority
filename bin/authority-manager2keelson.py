@@ -103,7 +103,8 @@ def main() -> int:
                 rec = codec.lease_record(st, effect.slot, args.issuer_id, effect.released, now_ts(), effect.lease)
                 put(f"command_authority/{codec.slot_path(vessel, effect.slot)}", rec)
             elif isinstance(effect, model.PublishAssignments):
-                put(f"command_assignment/{vessel}", codec.assignment_feed(st, args.issuer_id, args.heartbeat_s, args.feed_ttl_s, now_ts()))
+                put(f"command_assignment/{vessel}", codec.assignment_feed(st, args.issuer_id, args.heartbeat_s, args.feed_ttl_s, now_ts(),
+                                                                         manager.challenges.newest(manager.now_ms())))
                 for role in model.ASSIGNMENT_ROLES:
                     put(f"command_authority/{vessel}/{role}", codec.assignment_record(st, role, args.issuer_id))
             elif isinstance(effect, model.PublishNavigation):

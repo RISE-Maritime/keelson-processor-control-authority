@@ -15,6 +15,8 @@ dependencies = [
     # PENDING: the build has not been cut yet; until it is, develop against the #331 worktree's SDK in a
     # local venv (README, "Developing before the build").
     "keelson==0.6.0.dev21",
+    # Ed25519 for the ROC service's attestation (crowsnest-dev#312).
+    "cryptography==50.0.2",
 ]
 
 [project.optional-dependencies]

@@ -72,6 +72,31 @@ and ACKs with it, and only a COMMIT that the manager has already written to its 
   Ted decided that the motion gate mints `plant_generation` in both halves, which supersedes the
   older wording in #84.
 - **No `force_safety_release` anywhere:** the manager is not the supervisor.
+- **It verifies who is acting** (keelson#383, crowsnest-dev#312; trust chain B). `controller_id` is
+  a label. Every procedure that changes anything checks `Caller.attestation` first, under the one
+  lock, in the protocol's order, and refuses `REFUSAL_ATTESTATION` with the check that failed:
+  1. the claim parses;
+  2. the key is one this vessel trusts (and belongs to the service it names);
+  3. the Ed25519 signature is good;
+  4. the challenge is one this manager issued within `challenge_ttl_ms`, on its own clock;
+  5. the sequence rises for that key and session;
+  6. the claim is for this procedure;
+  7. the request digest is this request's;
+  8. `controller_id` / `controller_site` equal the claim's operator and site.
+
+  How it is enforced:
+  - **A present but bad attestation is always refused.** A missing one is refused only where the
+    policy requires it: `attestation.required`, which defaults to `command_profile == "operational"`.
+  - **No key, no start.** An operational policy with no trusted key refuses to load, because
+    nobody could command.
+  - **What is recorded.** The attested principal (operator, site, station, service, key, session)
+    is stamped on every lease and transfer the call creates or changes, and on its audit records
+    (`history` → `detail_json`).
+  - **The challenge.** A new one is drawn at every heartbeat and published on
+    `command_assignment` as `attestation_challenge`, and the accepted ones are in `get`. Challenges
+    are never persisted, so after a restart every older attestation is stale.
+  - **The keys** (`attestation.keys`: `key_id` → `service_id`, base64 raw 32-byte public key) are
+    maintenance configuration.
 - **It runs the maintenance procedure** (keelson `protocols/maintenance.yaml`, crowsnest-dev#91). It
   is the one writer of `maintenance_state/{vessel}`. The procedure goes INACTIVE → REQUESTED →
   PREPARING → MAINTENANCE → READY_FOR_CHECK → INACTIVE.
@@ -152,6 +177,9 @@ uv pip install --python .venv/bin/python -e ../keelson.worktrees/authority-inter
 
 When the build exists: set its exact version in `pyproject.toml`, run `uv lock`, and use
 `uv sync --locked --extra dev`.
+
+**Attestation needs keelson#383** (`feat/authority-attestation`, stacked on #377) and
+`cryptography`. Develop against that worktree's SDK in the same way.
 
 **Maintenance needs a newer build than the pin.** `MaintenanceState`, the four maintenance calls and
 `ResolvedControl` are on keelson's `feat/maintenance-state` branch, stacked on #361 and #359, and

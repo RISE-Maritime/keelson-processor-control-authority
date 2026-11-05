@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .attestation import parse_keys
 from .model import CONN, ENGINEER, HOLD, PAYLOAD, PROFILES_ALLOWED, ZERO, MaintenancePolicy, Policy
 
 
@@ -47,6 +48,12 @@ def parse(d: dict) -> Policy:
     succession = {}
     for role, who in (d.get("succession") or {}).items():
         succession[role] = "*" if who == "*" else frozenset(who)
+    att = d.get("attestation") or {}
+    keys = parse_keys(att.get("keys") or {})
+    required = bool(att.get("required", profile == "operational"))
+    # Required with nobody to vouch: every command would be refused. Say so at load, not at sea.
+    if required and not keys:
+        raise ValueError("attestation is required (operational) but the policy names no trusted key")
     return Policy(
         command_profile=profile,
         dofs=dofs,
@@ -58,6 +65,9 @@ def parse(d: dict) -> Policy:
         prepare_ttl_ms=int(d.get("prepare_ttl_ms", 2000)),
         succession=succession,
         maintenance=_maintenance(d.get("maintenance") or {}, dofs),
+        attestation_keys=keys,
+        attestation_required=required,
+        challenge_ttl_ms=int(att.get("challenge_ttl_ms", 15000)),
     )
 
 

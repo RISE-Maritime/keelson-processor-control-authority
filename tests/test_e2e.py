@@ -335,3 +335,33 @@ def test_maintenance_is_entered_on_what_the_manager_hears_and_published(h):
     states = [rec.state for rec in records]
     assert MaintenanceState.STATE_PREPARING in states and records[-1].maintainer == "anna@workshop"
     assert records[-1].revision == 3 and records[-1].manager_id == "authority-manager/0"
+
+
+def test_an_operational_vessel_refuses_an_unattested_call_and_takes_an_attested_one(h):
+    import base64
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    from control_authority.attestation import request_digest
+
+    key = Ed25519PrivateKey.generate()
+    pub = base64.b64encode(key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
+    h.gate.serve()
+    h.policy_extra = {"attestation": {"required": True,
+                                      "keys": {"roc1-a": {"service_id": "roc1-authority", "public_key": pub}}}}
+    h.start()
+    bare = h.take_conn()
+    assert (bare.result, bare.refusal) == (CommandResult.COMMAND_RESULT_DENIED, pb.Refusal.REFUSAL_ATTESTATION), bare.detail
+    challenge = h.call("get", pb.GetAuthorityRequest(), pb.AuthorityState).attestation_challenges[0]
+    rows = [ControlMapping(dof=d, execution_source=f"ROC-1/helm-1/{d}") for d in DOFS]
+    req = pb.RequestRoleRequest(caller=pb.Caller(controller_id="ted@ROC-1", controller_site="ROC-1"), role=Role.ROLE_CONN,
+                                mappings=rows)
+    claim = pb.AttestationClaim(service_id="roc1-authority", key_id="roc1-a", operator_id="ted@ROC-1", site="ROC-1",
+                                session_id="s1", sequence=1, challenge=challenge, procedure="request",
+                                request_sha256=request_digest(req)).SerializeToString()
+    req.caller.attestation.claim, req.caller.attestation.signature = claim, key.sign(claim)
+    r = h.call("request", req, pb.AuthorityReply)
+    assert r.result == CommandResult.COMMAND_RESULT_ACCEPTED, r.detail
+    hist = h.call("history", pb.HistoryRequest(), pb.HistoryReply)
+    assert any("roc1-authority" in rec.detail_json for rec in hist.records if rec.event == "active")
