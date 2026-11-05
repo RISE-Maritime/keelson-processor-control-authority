@@ -12,6 +12,9 @@ it is merged or run anywhere but the isolated tests.** Every commit message carr
   and publications run after it (service.py). Never send first and record later.
 - **Reconcile before any transfer**, toward the gate. A restart interrupts no healthy holder and mints
   nothing.
+- **Maintenance never arms and never commands the vehicle.** Its guards read what the manager has
+  heard, and an unheard, stale or non-VALID input never satisfies one. The procedure leaves
+  MAINTENANCE only through the required checks.
 - **Pure decisions.** `control_authority/model.py` has no clock, no store and no Zenoh; every
   decision is tested there or through service.py against `tests/fakegate.py`.
 - **One lock decides** (rpc.Handlers): every request, tick and heartbeat, gate round trips included.

@@ -2,7 +2,9 @@
 """keelson-processor-control-authority — the onboard authority manager (COMMAND-ARCHITECTURE.md §4).
 
 Exactly one per vessel. It serves `authority_manager/v1`, calls the motion gate over `control_gate/v1`,
-and is the one writer of `command_authority` records and of `command_assignment/{vessel}`.
+and is the one writer of `command_authority` records, of `command_assignment/{vessel}` and of
+`maintenance_state/{vessel}`. For the maintenance guards it hears `vehicle_armed` (the key the policy
+names) and `resolved_control/{vessel}`, stamped on local receipt. It never arms or commands the vehicle.
 
 Boot: open the store (an untrusted one stops the process) → rebase every lease → reconcile with the
 gate (until it answers, every transfer is refused NOT_RECONCILED) → republish every record → serve
@@ -22,6 +24,7 @@ import zenoh
 from google.protobuf.timestamp_pb2 import Timestamp
 from keelson.interfaces import AuthorityManager_pb2 as pb
 from keelson.payloads.Alarm_pb2 import Alarm
+from keelson.payloads.Primitives_pb2 import TimestampedBool
 from keelson.scaffolding import add_common_arguments, create_zenoh_config, setup_logging
 from keelson.scaffolding.liveliness import declare_liveliness
 from keelson.scaffolding.rpc import RpcOp, serve_rpc
@@ -49,6 +52,10 @@ REQUESTS = {
     "set_navigation_authority": pb.SetNavigationAuthorityRequest,
     "get": pb.GetAuthorityRequest,
     "history": pb.HistoryRequest,
+    "request_maintenance": pb.RequestMaintenanceRequest,
+    "cancel_maintenance": pb.CancelMaintenanceRequest,
+    "finish_maintenance": pb.FinishMaintenanceRequest,
+    "complete_maintenance_check": pb.CompleteMaintenanceCheckRequest,
 }
 
 
@@ -101,6 +108,8 @@ def main() -> int:
                     put(f"command_authority/{vessel}/{role}", codec.assignment_record(st, role, args.issuer_id))
             elif isinstance(effect, model.PublishNavigation):
                 put(f"command_authority/{vessel}/navigation", codec.navigation_record(st, args.issuer_id))
+            elif isinstance(effect, model.PublishMaintenance):
+                put(f"maintenance_state/{vessel}", codec.maintenance_record(st, effect.guards, args.issuer_id, now_ts()))
             elif isinstance(effect, model.Alarm):
                 log.warning("ALARM: %s", effect.text)
                 put(f"alarm/{args.source_id}", Alarm(timestamp=now_ts(), identifier=f"{args.source_id}/authority",
@@ -130,8 +139,33 @@ def main() -> int:
             publish(model.PublishLease(slot), manager.state)
         publish(model.PublishAssignments(), manager.state)
         publish(model.PublishNavigation(), manager.state)
+        publish(model.PublishMaintenance(manager.guards()), manager.state)
 
         handlers = Handlers(manager, args.issuer_id, args.heartbeat_s, args.feed_ttl_s)
+
+        def heard(fn):
+            def run(sample):
+                try:
+                    fn(keelson.uncover(sample.payload.to_bytes())[2])
+                except Exception:  # pylint: disable=broad-except
+                    log.exception("could not read %s", sample.key_expr)
+            return run
+
+        def on_armed(raw: bytes) -> None:
+            msg = TimestampedBool()
+            msg.ParseFromString(raw)
+            handlers.observe_armed(msg.value)
+
+        def on_resolved(raw: bytes) -> None:
+            rc = keelson.get_protobuf_message_class_from_type_name("keelson.ResolvedControl")()
+            rc.ParseFromString(raw)
+            handlers.observe_resolved(rc)
+
+        subs = [session.declare_subscriber(f"{base}/resolved_control/{vessel}", heard(on_resolved))]
+        if policy.maintenance.armed_key:
+            subs.append(session.declare_subscriber(policy.maintenance.armed_key, heard(on_armed)))
+        else:
+            log.warning("the policy names no maintenance.vehicle_armed_key: a maintenance request stays REQUESTED")
 
         def serve(name: str, op: RpcOp) -> None:
             req = REQUESTS[name]()
@@ -146,7 +180,7 @@ def main() -> int:
                   version="v1", handlers={name: functools.partial(serve, name) for name in REQUESTS}, log=log)
 
         with declare_liveliness(session, realm, vessel, args.source_id,
-                                pubsub_subjects=["command_authority", "command_assignment", "alarm"]), \
+                                pubsub_subjects=["command_authority", "command_assignment", "maintenance_state", "alarm"]), \
                 GracefulShutdown() as shutdown:
             last_hb = last_reconcile = time.monotonic()
             while not shutdown.is_requested():
@@ -164,6 +198,8 @@ def main() -> int:
                         last_hb = time.monotonic()
                 except Exception:  # pylint: disable=broad-except
                     log.exception("periodic work failed")
+        for sub in subs:
+            sub.undeclare()
     manager.store.close()
     return 0
 

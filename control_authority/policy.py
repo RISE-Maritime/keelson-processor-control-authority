@@ -6,7 +6,30 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .model import CONN, ENGINEER, PAYLOAD, PROFILES_ALLOWED, Policy
+from .model import CONN, ENGINEER, HOLD, PAYLOAD, PROFILES_ALLOWED, ZERO, MaintenancePolicy, Policy
+
+
+def _maintenance(d: dict, dofs: tuple) -> MaintenancePolicy:
+    rest = {str(k): str(v) for k, v in (d.get("rest") or {}).items()}
+    for dof, how in rest.items():
+        if dof not in dofs:
+            raise ValueError(f"maintenance.rest names a DOF the vessel does not have: {dof}")
+        if how not in (ZERO, HOLD):
+            raise ValueError(f"maintenance.rest.{dof} is {how!r}: zero or hold")
+    default = MaintenancePolicy()
+    checks = tuple(d.get("required_checks", default.required_checks))
+    # A vessel that requires no check would leave maintenance on nobody's word.
+    if not checks:
+        raise ValueError("maintenance.required_checks names at least one check")
+    return MaintenancePolicy(
+        rest=rest,
+        zero_tolerance_pct=float(d.get("zero_tolerance_pct", default.zero_tolerance_pct)),
+        feedback_max_age_ms=int(d.get("feedback_max_age_ms", default.feedback_max_age_ms)),
+        input_max_age_ms=int(d.get("input_max_age_ms", default.input_max_age_ms)),
+        payloads=tuple(d.get("payloads") or ()),
+        required_checks=checks,
+        armed_key=str(d.get("vehicle_armed_key", "")),
+    )
 
 
 def parse(d: dict) -> Policy:
@@ -34,6 +57,7 @@ def parse(d: dict) -> Policy:
         session_ttl_ms=int(d.get("session_ttl_ms", 30000)),
         prepare_ttl_ms=int(d.get("prepare_ttl_ms", 2000)),
         succession=succession,
+        maintenance=_maintenance(d.get("maintenance") or {}, dofs),
     )
 
 

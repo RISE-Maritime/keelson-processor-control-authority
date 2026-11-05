@@ -15,6 +15,7 @@ from keelson.interfaces.AuthorityManager_pb2 import (
     AssumeCommandReply,
     AuthorityReply,
     HistoryReply,
+    MaintenanceReply,
     Refusal,
     SetNavigationAuthorityReply,
 )
@@ -35,6 +36,8 @@ REFUSAL = {
     model.REFUSED_BY_GATE: Refusal.REFUSAL_GATE,
     model.REFUSED_NOT_UNREACHABLE: Refusal.REFUSAL_NOT_UNREACHABLE,
     model.REFUSED_MALFORMED: Refusal.REFUSAL_MALFORMED,
+    model.REFUSED_MAINTENANCE: Refusal.REFUSAL_MAINTENANCE,
+    model.REFUSED_GUARD: Refusal.REFUSAL_GUARD,
 }
 
 LEASE_ROLE = {Role.ROLE_CONN: model.CONN, Role.ROLE_ENGINEER: model.ENGINEER, Role.ROLE_PAYLOAD_AUTHORITY: model.PAYLOAD}
@@ -183,9 +186,38 @@ class Handlers:
             return SetNavigationAuthorityReply(result=result, refusal=refusal, detail=d.detail,
                                                document=codec.navigation_document(self.m.state))
 
+    # ------------------------------------------------------------------ maintenance (OVERALL_COMMAND only)
+
+    def _maintenance_reply(self, d: Decision) -> MaintenanceReply:
+        result, refusal = result_of(d.outcome)
+        return MaintenanceReply(result=result, refusal=refusal, detail=d.detail,
+                                record=codec.maintenance_record(self.m.state, self.m.guards(), self.issuer_id))
+
+    def request_maintenance(self, req) -> MaintenanceReply:
+        c = req.caller
+        with self.lock:
+            return self._maintenance_reply(self.m.request_maintenance(
+                c.controller_id, _revision(c), _token(c), req.maintainer, req.reason, codec.scopes_from_proto(req.scopes)))
+
+    def cancel_maintenance(self, req) -> MaintenanceReply:
+        c = req.caller
+        with self.lock:
+            return self._maintenance_reply(self.m.cancel_maintenance(c.controller_id, _revision(c), _token(c), req.reason))
+
+    def finish_maintenance(self, req) -> MaintenanceReply:
+        c = req.caller
+        with self.lock:
+            return self._maintenance_reply(self.m.finish_maintenance(c.controller_id, _revision(c), _token(c), req.detail))
+
+    def complete_maintenance_check(self, req) -> MaintenanceReply:
+        c = req.caller
+        with self.lock:
+            return self._maintenance_reply(self.m.complete_maintenance_check(
+                c.controller_id, _revision(c), _token(c), codec.checks_from_proto(req.checks)))
+
     def get(self, req):
         with self.lock:
-            return codec.authority_state(self.m.state, self.issuer_id, self.hb_s, self.feed_ttl_s)
+            return codec.authority_state(self.m.state, self.issuer_id, self.hb_s, self.feed_ttl_s, self.m.guards())
 
     def history(self, req) -> HistoryReply:
         limit = req.limit or 1000
@@ -198,6 +230,17 @@ class Handlers:
     def tick(self) -> None:
         with self.lock:
             self.m.tick()
+
+    # What the maintenance guards read: from the subscriber threads, so under the same lock.
+
+    def observe_armed(self, armed: bool) -> None:
+        with self.lock:
+            self.m.observe_armed(armed)
+
+    def observe_resolved(self, rc) -> None:
+        dofs = codec.resolved_from_proto(rc)
+        with self.lock:
+            self.m.observe_resolved(dofs)
 
     def heartbeat(self) -> None:
         with self.lock:

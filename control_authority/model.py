@@ -5,7 +5,9 @@ crowsnest-dev docs/COMMAND-ARCHITECTURE.md §0, §4 ("I2", "I7", "I10", "I13" ar
 
 WHAT THE MANAGER OWNS: the role leases (CONN, ENGINEER, PAYLOAD_AUTHORITY), the OVERALL and
 NAVIGATIONAL_COMMAND assignments and their sessions, the navigation authority document, the
-`active_control_station`, and the record of every transfer it proposed.
+`active_control_station`, the record of every transfer it proposed, and the maintenance procedure
+(keelson protocols/maintenance.yaml), which it steps on what it has heard and never by arming or
+commanding the vehicle.
 
 WHAT IT NEVER DOES: mint a motion fence. It PROPOSES a transfer -- `PREPARE {transfer_id, mappings,
 station, prepare_ttl_ms}`, with no fence -- and the gate validates against what it is emitting now,
@@ -51,6 +53,17 @@ REFUSED_MAP = "REFUSED_MAP"
 REFUSED_MALFORMED = "REFUSED_MALFORMED"
 REFUSED_NOT_UNREACHABLE = "REFUSED_NOT_UNREACHABLE"
 REFUSED_BY_GATE = "REFUSED_BY_GATE"
+REFUSED_MAINTENANCE = "REFUSED_MAINTENANCE"  # the vessel is in maintenance: no transfer but an abort, no payload authority
+REFUSED_GUARD = "REFUSED_GUARD"  # a maintenance step its state or a guard does not allow
+
+# Maintenance (keelson protocols/maintenance.yaml): a procedure, not a role and not a lease.
+M_INACTIVE, M_REQUESTED, M_PREPARING, M_MAINTENANCE, M_READY = (
+    "inactive", "requested", "preparing", "maintenance", "ready_for_check")
+MAINTENANCE_STATES = (M_INACTIVE, M_REQUESTED, M_PREPARING, M_MAINTENANCE, M_READY)
+# From PREPARING until INACTIVE: no transfer but abort_automation, no payload authority.
+IN_MAINTENANCE = (M_PREPARING, M_MAINTENANCE, M_READY)
+SCOPES = ("software", "firmware", "network", "calibration", "deployment", "configuration")
+ZERO, HOLD = "zero", "hold"  # how a DOF is at rest
 
 
 def slot_of(role: str, payload_id: str = "") -> str:
@@ -165,6 +178,66 @@ class Transfer:
 
 
 @dataclass(frozen=True)
+class Check:
+    """One required check's result, as the master reported it (complete_maintenance_check)."""
+
+    name: str
+    passed: bool
+    detail: str = ""
+    evidence: str = ""
+
+
+@dataclass(frozen=True)
+class Maintenance:
+    """The maintenance procedure as the manager records it. Persisted; the GUARDS are not -- they are
+    derived from what the manager has heard, which is never persisted either (see Heard). The two
+    wall-clock times are for the record a station shows, never for a decision (§0)."""
+
+    state: str = M_INACTIVE
+    maintenance_id: str = ""
+    revision: int = 0
+    requested_by: str = ""
+    overall_assignment_id: str = ""
+    overall_assignment_revision: int = 0
+    maintainer: str = ""
+    reason: str = ""
+    scopes: tuple[str, ...] = ()
+    issued_wall_ms: int = 0
+    since_wall_ms: int = 0
+    checks: tuple[Check, ...] = ()
+
+
+@dataclass(frozen=True)
+class Guard:
+    name: str
+    satisfied: bool
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class DofReading:
+    """One DOF of the gate's `resolved_control`: what the feedback says it is doing."""
+
+    actual_pct: float | None
+    feedback_quality: str  # "VALID", "STALE", "ESTIMATED", "NONE", "UNSPECIFIED"
+    actual_age_ms: int | None
+    control_state: str  # "ACTIVE", "STALE", "TRANSITION", "INHIBITED", "UNMAPPED", "UNSPECIFIED"
+
+
+@dataclass(frozen=True)
+class Heard:
+    """What the guards read, stamped on THIS process's monotonic clock at local receipt. Never
+    persisted: after a restart a guard holds again only once its input is heard again."""
+
+    armed: bool | None = None
+    armed_ms: int | None = None
+    resolved: dict = field(default_factory=dict)  # dof -> DofReading, from the last resolved_control
+    resolved_ms: int | None = None
+    # payload_id -> True when it reports its safe state. Nothing reports one yet (keelson#372).
+    payload_safe: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class InForce:
     """What the gate is enforcing, as far as the manager knows: set from a confirmed COMMIT, and
     overwritten by the gate's exposed state at every reconciliation (the gate is the truth)."""
@@ -186,6 +259,7 @@ class State:
     responsible_roc: str = ""
     in_force: InForce = field(default_factory=InForce)
     transfers: dict = field(default_factory=dict)  # transfer_id -> Transfer
+    maintenance: Maintenance = field(default_factory=Maintenance)
     # Not persisted: false at every boot until the gate's exposed state has been read (I13).
     reconciled: bool = False
 
@@ -233,6 +307,14 @@ class PublishNavigation:
 
 
 @dataclass(frozen=True)
+class PublishMaintenance:
+    """`maintenance_state/{vessel}`: on every transition and guard change, and at the heartbeat. The
+    service fills in the guards it derives from what it has heard."""
+
+    guards: tuple = ()
+
+
+@dataclass(frozen=True)
 class Alarm:
     text: str
 
@@ -256,6 +338,19 @@ def _same(state: State, outcome: str, detail: str = "", audits=()) -> Decision:
 
 
 @dataclass(frozen=True)
+class MaintenancePolicy:
+    """How this vessel is at rest, and what it must pass to leave maintenance."""
+
+    rest: dict = field(default_factory=dict)  # dof -> ZERO | HOLD; a DOF not named is ZERO
+    zero_tolerance_pct: float = 1.0
+    feedback_max_age_ms: int = 2000  # a DOF's actual_age_ms, as the gate reports it
+    input_max_age_ms: int = 3000  # since vehicle_armed / resolved_control was last heard here
+    payloads: tuple[str, ...] = ()  # the platform's payloads[] ids
+    required_checks: tuple[str, ...] = ("self_test", "configuration_valid")
+    armed_key: str = ""  # the vehicle_armed key expression the service subscribes to
+
+
+@dataclass(frozen=True)
 class Policy:
     """The vessel's control matrix and timings (platform registry; changes only in maintenance)."""
 
@@ -269,6 +364,7 @@ class Policy:
     prepare_ttl_ms: int = 2000
     # role -> principals allowed to ASSUME it, or "*" for any human
     succession: dict = field(default_factory=dict)
+    maintenance: MaintenancePolicy = field(default_factory=MaintenancePolicy)
 
     def ttl(self, role: str) -> int:
         return int(self.lease_ttl_ms.get(role, 30000))
@@ -286,6 +382,8 @@ def take_lease(state: State, policy: Policy, role: str, principal: str, site: st
     conn is a motion transfer (`begin_transfer` GRANT), because its DOFs move with it."""
     if role not in (ENGINEER, PAYLOAD) or (role == PAYLOAD and not payload_id):
         return _same(state, REFUSED_MALFORMED, "only ENGINEER and PAYLOAD_AUTHORITY are taken directly; the conn is a transfer")
+    if role == PAYLOAD and state.maintenance.state in IN_MAINTENANCE:
+        return _same(state, REFUSED_MAINTENANCE, f"the vessel is {state.maintenance.state.upper()}: no payload authority until INACTIVE")
     slot = slot_of(role, payload_id)
     held = state.live_lease(slot, now_ms)
     if held is not None and held.holder != principal:
@@ -550,6 +648,9 @@ def begin_transfer(state: State, policy: Policy, req: TransferRequest, now_ms: i
     emitting now (a manager-side check is a time-of-check / time-of-use race, §4)."""
     if req.kind not in TRANSFER_KINDS:
         return _same(state, REFUSED_MALFORMED, f"unknown transfer kind {req.kind!r}")
+    if state.maintenance.state in IN_MAINTENANCE and req.kind != ABORT_AUTOMATION:
+        return _same(state, REFUSED_MAINTENANCE,
+                     f"the vessel is {state.maintenance.state.upper()}: no transfer but abort_automation until INACTIVE")
     if not state.reconciled:
         return _same(state, REFUSED_NOT_RECONCILED, "the gate's exposed state has not been read since start")
     busy = state.in_flight()
@@ -749,6 +850,174 @@ def reconcile(state: State, policy: Policy, gate_fence: Fence | None, gate_mappi
         effects.append(Alarm("the gate's state differed from the manager's record; the gate's was adopted"))
     st = replace(st, in_force=gate, active_station=gate_station or st.active_station, reconciled=True)
     return Decision(st, ACCEPTED, "", tuple(effects), (*audits, _audit("reconciled", fence=_fence_json(gate_fence))))
+
+
+# ---------------------------------------------------------------------------- maintenance
+
+
+def _authorise_master(state: State, principal: str, revision: int | None, session_token: str, now_ms: int):
+    outcome, detail, _ = authorise_privileged(state, (OVERALL,), principal, revision, session_token, now_ms)
+    if outcome != ACCEPTED:
+        return _same(state, outcome, "maintenance is the OVERALL_COMMAND assignee's alone: " + detail)
+    return None
+
+
+def _move(state: State, to: str, wall_ms: int, event: str, alarm: str = "", **changes) -> tuple[State, tuple, dict]:
+    m = replace(state.maintenance, state=to, revision=state.maintenance.revision + 1, since_wall_ms=wall_ms, **changes)
+    effects = (PublishMaintenance(),) + ((Alarm(alarm),) if alarm else ())
+    audit = _audit(event, maintenance_id=m.maintenance_id, to=to, revision=m.revision)
+    return replace(state, maintenance=m), effects, audit
+
+
+def request_maintenance(state: State, principal: str, revision: int | None, session_token: str, maintainer: str,
+                        reason: str, scopes, now_ms: int, wall_ms: int) -> Decision:
+    """INACTIVE → REQUESTED. The master names who does the work, why, and what it may touch. Nothing
+    is commanded: the guards (advance_maintenance) wait for her to be disarmed and at rest."""
+    refused = _authorise_master(state, principal, revision, session_token, now_ms)
+    if refused:
+        return refused
+    if state.maintenance.state != M_INACTIVE:
+        return _same(state, REFUSED_GUARD, f"maintenance is already {state.maintenance.state.upper()}")
+    scopes = tuple(scopes)
+    if not maintainer or not reason or not scopes:
+        return _same(state, REFUSED_MALFORMED, "a maintenance request names the maintainer, the reason and a scope")
+    unknown = sorted(set(scopes) - set(SCOPES))
+    if unknown:
+        return _same(state, REFUSED_MALFORMED, f"unknown scope: {', '.join(unknown)}")
+    a = state.overall
+    st = replace(state, maintenance=replace(state.maintenance, maintenance_id=new_id(), requested_by=principal,
+                                            overall_assignment_id=a.assignment_id, overall_assignment_revision=a.revision,
+                                            maintainer=maintainer, reason=reason, scopes=scopes,
+                                            issued_wall_ms=wall_ms, checks=()))
+    st, effects, audit = _move(st, M_REQUESTED, wall_ms, "maintenance_requested",
+                               f"maintenance requested by {principal} for {maintainer}: {reason}")
+    return Decision(st, ACCEPTED, "", effects,
+                    ({**audit, "by": principal, "maintainer": maintainer, "reason": reason, "scopes": list(scopes)},))
+
+
+def cancel_maintenance(state: State, principal: str, revision: int | None, session_token: str, reason: str,
+                       now_ms: int, wall_ms: int) -> Decision:
+    """REQUESTED or PREPARING → INACTIVE: nothing has changed yet. MAINTENANCE and READY_FOR_CHECK
+    leave only through the checks."""
+    refused = _authorise_master(state, principal, revision, session_token, now_ms)
+    if refused:
+        return refused
+    if state.maintenance.state not in (M_REQUESTED, M_PREPARING):
+        return _same(state, REFUSED_GUARD,
+                     f"maintenance is {state.maintenance.state.upper()}: only REQUESTED or PREPARING is cancelled; "
+                     "MAINTENANCE leaves through the checks")
+    st, effects, audit = _move(state, M_INACTIVE, wall_ms, "maintenance_cancelled",
+                               f"maintenance cancelled by {principal}: {reason or 'no reason given'}")
+    return Decision(st, ACCEPTED, "", effects, ({**audit, "by": principal, "reason": reason},))
+
+
+def finish_maintenance(state: State, principal: str, revision: int | None, session_token: str, detail: str,
+                       now_ms: int, wall_ms: int) -> Decision:
+    """MAINTENANCE → READY_FOR_CHECK: the work is declared done."""
+    refused = _authorise_master(state, principal, revision, session_token, now_ms)
+    if refused:
+        return refused
+    if state.maintenance.state != M_MAINTENANCE:
+        return _same(state, REFUSED_GUARD, f"maintenance is {state.maintenance.state.upper()}, not MAINTENANCE")
+    st, effects, audit = _move(state, M_READY, wall_ms, "maintenance_finished", checks=())
+    return Decision(st, ACCEPTED, "", effects, ({**audit, "by": principal, "detail": detail},))
+
+
+def complete_maintenance_check(state: State, policy: Policy, principal: str, revision: int | None, session_token: str,
+                               checks, now_ms: int, wall_ms: int) -> Decision:
+    """READY_FOR_CHECK → INACTIVE when every check the vessel requires is reported passed; →
+    MAINTENANCE when any reported check failed. A required check not reported refuses the call and
+    the state stays: a missing result is not a pass. The results are recorded either way."""
+    refused = _authorise_master(state, principal, revision, session_token, now_ms)
+    if refused:
+        return refused
+    if state.maintenance.state != M_READY:
+        return _same(state, REFUSED_GUARD, f"maintenance is {state.maintenance.state.upper()}, not READY_FOR_CHECK")
+    checks = tuple(checks)
+    names = [c.name for c in checks]
+    if not all(names) or len(set(names)) != len(names):
+        return _same(state, REFUSED_MALFORMED, "every check is named once")
+    missing = [n for n in policy.maintenance.required_checks if n not in names]
+    if missing:
+        return _same(state, REFUSED_GUARD, f"required check(s) not reported: {', '.join(missing)}")
+    failed = [c.name for c in checks if not c.passed]
+    results = [{"name": c.name, "passed": c.passed, "evidence": c.evidence} for c in checks]
+    if failed:
+        st, effects, audit = _move(state, M_MAINTENANCE, wall_ms, "maintenance_check_failed",
+                                   f"maintenance check failed: {', '.join(failed)}; back to MAINTENANCE", checks=checks)
+        return Decision(st, ACCEPTED, f"failed: {', '.join(failed)}; back to MAINTENANCE", effects,
+                        ({**audit, "by": principal, "checks": results},))
+    st, effects, audit = _move(state, M_INACTIVE, wall_ms, "maintenance_completed",
+                               "maintenance complete: INACTIVE (nothing here arms her)", checks=checks)
+    return Decision(st, ACCEPTED, "", effects, ({**audit, "by": principal, "checks": results},))
+
+
+def _fresh(heard_ms: int | None, now_ms: int, max_age_ms: int) -> bool:
+    return heard_ms is not None and now_ms - heard_ms <= max_age_ms
+
+
+def _dof_guard(dof: str, mp: MaintenancePolicy, heard: Heard, now_ms: int) -> Guard:
+    name = f"dof_at_rest/{dof}"
+    if heard.resolved_ms is None:
+        return Guard(name, False, "resolved_control not heard")
+    if not _fresh(heard.resolved_ms, now_ms, mp.input_max_age_ms):
+        return Guard(name, False, f"resolved_control not heard for {now_ms - heard.resolved_ms} ms")
+    r = heard.resolved.get(dof)
+    if r is None:
+        return Guard(name, False, "not in resolved_control")
+    # Only a reading is a reading: STALE, ESTIMATED and NONE feedback are never at rest.
+    if r.feedback_quality != "VALID":
+        return Guard(name, False, f"feedback is {r.feedback_quality}")
+    if r.actual_age_ms is None or r.actual_age_ms > mp.feedback_max_age_ms or r.actual_pct is None:
+        return Guard(name, False, "no fresh actual value")
+    if mp.rest.get(dof, ZERO) == HOLD:
+        # Holding: nothing is driving it. The feedback says where it holds.
+        if r.control_state == "ACTIVE":
+            return Guard(name, False, f"driven by its source ({r.actual_pct:.1f} %)")
+        return Guard(name, True, f"holding at {r.actual_pct:.1f} %")
+    if abs(r.actual_pct) > mp.zero_tolerance_pct:
+        return Guard(name, False, f"at {r.actual_pct:.1f} %, not zero")
+    return Guard(name, True, "at zero")
+
+
+def maintenance_guards(state: State, policy: Policy, heard: Heard, now_ms: int) -> tuple[Guard, ...]:
+    """What the next automatic step waits on: REQUESTED → disarmed and every DOF at rest; PREPARING →
+    every payload in its safe state. Nothing else has a guard. An unheard input never satisfies one."""
+    mp = policy.maintenance
+    if state.maintenance.state == M_REQUESTED:
+        if heard.armed_ms is None:
+            disarmed = Guard("disarmed", False, "vehicle_armed not heard")
+        elif not _fresh(heard.armed_ms, now_ms, mp.input_max_age_ms):
+            disarmed = Guard("disarmed", False, f"vehicle_armed not heard for {now_ms - heard.armed_ms} ms")
+        elif heard.armed is not False:
+            disarmed = Guard("disarmed", False, "vehicle_armed is true: whoever holds the conn disarms her")
+        else:
+            disarmed = Guard("disarmed", True, "vehicle_armed is false")
+        return (disarmed, *(_dof_guard(d, mp, heard, now_ms) for d in policy.dofs))
+    if state.maintenance.state == M_PREPARING:
+        return tuple(Guard(f"payload_safe/{p}", True, "in its safe state") if heard.payload_safe.get(p) is True
+                     else Guard(f"payload_safe/{p}", False, "no payload state is reported (keelson#372)")
+                     for p in mp.payloads)
+    return ()
+
+
+def advance_maintenance(state: State, policy: Policy, heard: Heard, now_ms: int, wall_ms: int) -> Decision:
+    """The manager's own steps, every tick: REQUESTED → PREPARING when every guard holds -- vacating
+    every PAYLOAD_AUTHORITY lease in the same decision, so each payload gate goes to its safe state --
+    and PREPARING → MAINTENANCE when every payload reports its safe state. One step per call."""
+    if state.maintenance.state not in (M_REQUESTED, M_PREPARING):
+        return _same(state, ACCEPTED)
+    if not all(g.satisfied for g in maintenance_guards(state, policy, heard, now_ms)):
+        return _same(state, ACCEPTED)
+    if state.maintenance.state == M_REQUESTED:
+        vacated = {s: lease for s, lease in state.leases.items() if s.startswith(f"{PAYLOAD}/")}
+        st = replace(state, leases={s: lease for s, lease in state.leases.items() if s not in vacated})
+        st, effects, audit = _move(st, M_PREPARING, wall_ms, "maintenance_preparing")
+        effects = (*(PublishLease(s, True, lease) for s, lease in vacated.items()), *effects)
+        return Decision(st, ACCEPTED, "", effects, ({**audit, "payload_leases_vacated": sorted(vacated)},))
+    st, effects, audit = _move(state, M_MAINTENANCE, wall_ms, "maintenance_entered",
+                               f"MAINTENANCE: {state.maintenance.maintainer} may change {', '.join(state.maintenance.scopes)}")
+    return Decision(st, ACCEPTED, "", effects, (audit,))
 
 
 # ---------------------------------------------------------------------------- audit helpers

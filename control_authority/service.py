@@ -74,6 +74,9 @@ class Manager:
         self.now_ms = now_ms
         self.audit_ms = audit_ms
         self.state: State | None = None
+        # What the maintenance guards read, on local receipt. Never persisted (model.Heard).
+        self.heard = model.Heard()
+        self._published_guards: tuple | None = None
 
     # ------------------------------------------------------------------ boot
 
@@ -165,14 +168,53 @@ class Manager:
         return self._apply(model.set_navigation_function(self.state, function, fn, by, by_revision, session_token,
                                                          self.now_ms()))
 
+    # ------------------------------------------------------------------ maintenance
+
+    def observe_armed(self, armed: bool) -> None:
+        self.heard = replace(self.heard, armed=bool(armed), armed_ms=self.now_ms())
+
+    def observe_resolved(self, dofs: dict) -> None:
+        """The gate's latest resolved_control, as {dof: DofReading}. Replaces the last one whole."""
+        self.heard = replace(self.heard, resolved=dict(dofs), resolved_ms=self.now_ms())
+
+    def guards(self) -> tuple:
+        return model.maintenance_guards(self.state, self.policy, self.heard, self.now_ms())
+
+    def request_maintenance(self, principal, revision, session_token, maintainer, reason, scopes) -> Decision:
+        return self._apply(model.request_maintenance(self.state, principal, revision, session_token, maintainer, reason,
+                                                     scopes, self.now_ms(), self.audit_ms()))
+
+    def cancel_maintenance(self, principal, revision, session_token, reason) -> Decision:
+        return self._apply(model.cancel_maintenance(self.state, principal, revision, session_token, reason,
+                                                    self.now_ms(), self.audit_ms()))
+
+    def finish_maintenance(self, principal, revision, session_token, detail) -> Decision:
+        return self._apply(model.finish_maintenance(self.state, principal, revision, session_token, detail,
+                                                    self.now_ms(), self.audit_ms()))
+
+    def complete_maintenance_check(self, principal, revision, session_token, checks) -> Decision:
+        return self._apply(model.complete_maintenance_check(self.state, self.policy, principal, revision, session_token,
+                                                            checks, self.now_ms(), self.audit_ms()))
+
+    # ------------------------------------------------------------------ the periodic work
+
     def tick(self) -> None:
-        """Expiry, the legacy synthesis, and the assignment feed's heartbeat."""
+        """Expiry, the legacy synthesis, the maintenance steps, and a republish when a guard changed."""
         now = self.now_ms()
         self._apply(model.expire(self.state, now))
         self._apply(model.synthesise_assignments(self.state, self.policy, now))
+        self._apply(model.advance_maintenance(self.state, self.policy, self.heard, now, self.audit_ms()))
+        if self.guards() != self._published_guards:
+            self._publish_maintenance()
 
     def heartbeat(self) -> None:
         self._publish(model.PublishAssignments(), self.state)
+        self._publish_maintenance()
+
+    def _publish_maintenance(self) -> None:
+        guards = self.guards()
+        self._published_guards = guards
+        self._publish(model.PublishMaintenance(guards), self.state)
 
     def history(self, limit=1000) -> list[dict]:
         return self.store.audit(limit)
@@ -186,6 +228,9 @@ class Manager:
         self.state = d.state
         for effect in d.effects:
             if isinstance(effect, (model.GatePrepare, model.GateCommit)):
+                continue
+            if isinstance(effect, model.PublishMaintenance):
+                self._publish_maintenance()  # with the guards of the state just committed
                 continue
             self._publish(effect, self.state)
         return d

@@ -185,7 +185,74 @@ def nav_function_from_proto(fa: FunctionAuthority):
     return model.NavFunction(fa.holder, fa.holder_lease_id, int(fa.control_method), env)
 
 
-def authority_state(st: State, issuer_id: str, heartbeat_interval_seconds: int, feed_ttl_seconds: int):
+# ---------------------------------------------------------------------------- maintenance
+# MaintenanceState is keelson's maintenance PR (stacked on #361): imported where used, like the
+# interface types, so the rest of the manager still imports on a build without it.
+
+
+def _maintenance_pb():
+    from keelson.payloads.MaintenanceState_pb2 import MaintenanceState
+
+    return MaintenanceState
+
+
+def maintenance_record(st: State, guards, manager_id: str, now: Timestamp | None = None):
+    MaintenanceState = _maintenance_pb()
+    m = st.maintenance
+    out = MaintenanceState(
+        vessel_id=st.vessel_id, state=MaintenanceState.State.Value(f"STATE_{m.state.upper()}"),
+        maintenance_id=m.maintenance_id, revision=m.revision, requested_by=m.requested_by,
+        overall_assignment_id=m.overall_assignment_id, overall_assignment_revision=m.overall_assignment_revision,
+        maintainer=m.maintainer, reason=m.reason,
+        scopes=[MaintenanceState.Scope.Value(f"SCOPE_{s.upper()}") for s in m.scopes],
+        guards=[MaintenanceState.Guard(name=g.name, satisfied=g.satisfied, detail=g.detail) for g in guards],
+        checks=[MaintenanceState.CheckResult(name=c.name, passed=c.passed, detail=c.detail, evidence=c.evidence)
+                for c in m.checks],
+        manager_id=manager_id,
+    )
+    if m.issued_wall_ms:
+        out.issued_at.FromMilliseconds(m.issued_wall_ms)
+    if m.since_wall_ms:
+        out.since.FromMilliseconds(m.since_wall_ms)
+    if now is not None:
+        out.timestamp.CopyFrom(now)
+    return out
+
+
+def scopes_from_proto(values) -> tuple[str, ...]:
+    """Scope enums as the model's names. UNSPECIFIED, or a number this build does not know, keeps a
+    name the model refuses as unknown -- never a silent drop that would narrow the request."""
+    MaintenanceState = _maintenance_pb()
+    names = []
+    for v in values:
+        try:
+            names.append(MaintenanceState.Scope.Name(v).removeprefix("SCOPE_").lower())
+        except ValueError:
+            names.append(f"scope_{v}")
+    return tuple(names)
+
+
+def checks_from_proto(pbs) -> tuple[model.Check, ...]:
+    return tuple(model.Check(c.name, bool(c.passed), c.detail, c.evidence) for c in pbs)
+
+
+def resolved_from_proto(rc) -> dict:
+    """`resolved_control`'s DOFs as the guard reads them. Absent stays absent: no actual is None,
+    never 0."""
+    from keelson.payloads.ResolvedControl_pb2 import ControlState, FeedbackQuality
+
+    return {
+        d.dof: model.DofReading(
+            actual_pct=d.actual_pct if d.HasField("actual_pct") else None,
+            feedback_quality=FeedbackQuality.Name(d.feedback_quality).removeprefix("FEEDBACK_QUALITY_"),
+            actual_age_ms=d.actual_age_ms if d.HasField("actual_age_ms") else None,
+            control_state=ControlState.Name(d.control_state).removeprefix("CONTROL_STATE_"),
+        )
+        for d in rc.dofs
+    }
+
+
+def authority_state(st: State, issuer_id: str, heartbeat_interval_seconds: int, feed_ttl_seconds: int, guards=()):
     from keelson.interfaces.AuthorityManager_pb2 import AuthorityState
 
     out = AuthorityState(vessel_id=st.vessel_id, active_control_station=st.active_station, reconciled=st.reconciled,
@@ -195,6 +262,7 @@ def authority_state(st: State, issuer_id: str, heartbeat_interval_seconds: int, 
     out.navigation.CopyFrom(navigation_document(st))
     if st.in_force.fence is not None:
         out.fence.CopyFrom(fence_to_proto(st.in_force.fence))
+    out.maintenance.CopyFrom(maintenance_record(st, guards, issuer_id))
     return out
 
 

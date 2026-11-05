@@ -72,6 +72,32 @@ and ACKs with it, and only a COMMIT that the manager has already written to its 
   Ted decided that the motion gate mints `plant_generation` in both halves, which supersedes the
   older wording in #84.
 - **No `force_safety_release` anywhere:** the manager is not the supervisor.
+- **It runs the maintenance procedure** (keelson `protocols/maintenance.yaml`, crowsnest-dev#91). It
+  is the one writer of `maintenance_state/{vessel}`. The procedure goes INACTIVE → REQUESTED →
+  PREPARING → MAINTENANCE → READY_FOR_CHECK → INACTIVE.
+  - **OVERALL_COMMAND only:** `request_maintenance`, `cancel_maintenance` (from REQUESTED or
+    PREPARING only), `finish_maintenance` and `complete_maintenance_check`, each under the current
+    revision and a live session.
+  - **The manager's own steps**, at every tick, on what it has heard (stamped on local receipt and
+    never persisted):
+    - REQUESTED → PREPARING when `vehicle_armed` (the key `maintenance.vehicle_armed_key` names) is
+      false and fresh, and `resolved_control/{vessel}` reports every DOF at rest. At rest means at
+      zero within the tolerance, or holding and not driven where the policy says `hold`, from VALID
+      feedback no older than `feedback_max_age_ms`. Absent, STALE, ESTIMATED or NONE feedback is
+      never at rest.
+    - PREPARING vacates every PAYLOAD_AUTHORITY lease, publishes it released, and refuses new ones.
+      PREPARING → MAINTENANCE when every payload in `maintenance.payloads` reports its safe state.
+      **No subject carries that yet (keelson#372), so a vessel that declares payloads stays in
+      PREPARING.** It fails closed.
+  - **From PREPARING until INACTIVE:** every transfer but abort_automation is refused
+    (REFUSAL_MAINTENANCE).
+  - **Out only through the checks:** every one of `maintenance.required_checks` (default
+    `self_test`, `configuration_valid`) reported passed returns her to INACTIVE. Any failed check
+    returns her to MAINTENANCE. A missing one refuses the call.
+  - **It never arms and never commands the vehicle.** A request made while she is armed waits in
+    REQUESTED until whoever holds the conn disarms her. The supervisor's and the gate's
+    ACTUATION_ALLOWED, the vehicle connector's arming, and the config-write gating read the record;
+    those are their changes, not this one.
 
 **A lost store.** A store that fails its integrity check, its schema or its hash is refused, and the
 service does not start. Unlike the safety supervisor, there is no "more inhibited" state to fall
@@ -84,6 +110,7 @@ re-initialising a store, which would reconcile everything from the gate, is not 
 | --- | --- |
 | serves `authority_manager/v1` as responder `authority-manager` | `command_authority/{vessel}` (the conn), `…/{vessel}/engineer`, `…/{vessel}/payload/{id}`, `…/{vessel}/overall[/session]`, `…/{vessel}/navigational[/session]`, `…/{vessel}/navigation` |
 | calls `control_gate/v1` on responder `control-gate` (`--gate-responder-id`) | `command_assignment/{vessel}`, on every change and at `--heartbeat-s` |
+| hears `resolved_control/{vessel}` and the `maintenance.vehicle_armed_key` | `maintenance_state/{vessel}`, on every transition and guard change, and at `--heartbeat-s` |
 | | `alarm/authority-manager`: a lapsed session, a succession, a reconcile disagreement, an unapplied transfer |
 | | liveliness: the source token, the RPC interface token, and the pubsub subjects |
 
@@ -125,6 +152,12 @@ uv pip install --python .venv/bin/python -e ../keelson.worktrees/authority-inter
 
 When the build exists: set its exact version in `pyproject.toml`, run `uv lock`, and use
 `uv sync --locked --extra dev`.
+
+**Maintenance needs a newer build than the pin.** `MaintenanceState`, the four maintenance calls and
+`ResolvedControl` are on keelson's `feat/maintenance-state` branch, stacked on #361 and #359, and
+`0.6.0.dev21` does not carry them. Until an experimental build carries all three, develop against
+that worktree's SDK, as above. CI on the pin fails the maintenance tests, and only those, until the
+pin moves.
 
 ## Not in this cut
 

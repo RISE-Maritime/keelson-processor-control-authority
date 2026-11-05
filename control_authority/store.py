@@ -21,7 +21,20 @@ import sqlite3
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from .model import Assignment, Fence, InForce, Lease, Mapping, NavFunction, State, Succession, Transfer
+from .model import (
+    MAINTENANCE_STATES,
+    Assignment,
+    Check,
+    Fence,
+    InForce,
+    Lease,
+    Maintenance,
+    Mapping,
+    NavFunction,
+    State,
+    Succession,
+    Transfer,
+)
 
 SCHEMA_VERSION = 1
 
@@ -64,6 +77,15 @@ def _assignment(d):
     return Assignment(d["assignee"], d["assignment_id"], int(d["revision"]), bool(d.get("synthesised")), succ)
 
 
+def _maintenance(d):
+    # A store written before maintenance existed had no procedure in force: INACTIVE.
+    if d is None:
+        return Maintenance()
+    if d["state"] not in MAINTENANCE_STATES:
+        raise ValueError(f"unknown maintenance state {d['state']!r}")
+    return Maintenance(**{**d, "scopes": tuple(d["scopes"]), "checks": tuple(Check(**c) for c in d["checks"])})
+
+
 def state_from_json(d: dict) -> State:
     return State(
         vessel_id=d["vessel_id"],
@@ -79,6 +101,7 @@ def state_from_json(d: dict) -> State:
                          _fence(d["in_force"]["fence"])),
         transfers={k: Transfer(**{**v, "mappings": tuple(_mapping(m) for m in v["mappings"]), "fence": _fence(v["fence"])})
                    for k, v in d["transfers"].items()},
+        maintenance=_maintenance(d.get("maintenance")),
         reconciled=False,
     )
 

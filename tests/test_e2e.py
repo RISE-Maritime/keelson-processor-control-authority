@@ -128,7 +128,8 @@ class Harness:
         zcfg.write_text(json.dumps({"mode": "peer", "scouting": {"multicast": {"enabled": False}, "gossip": {"enabled": False}},
                                     "connect": {"endpoints": [f"tcp/127.0.0.1:{self.port}"]}, "listen": {"endpoints": []}}))
         policy = self.tmp / "policy.json"
-        policy.write_text(json.dumps({"command_profile": "test", "dofs": DOFS, "lease_ttl_ms": {"conn": 30000}}))
+        policy.write_text(json.dumps({"command_profile": "test", "dofs": DOFS, "lease_ttl_ms": {"conn": 30000},
+                                      **getattr(self, "policy_extra", {})}))
         self.proc = subprocess.Popen(
             [sys.executable, str(ROOT / "bin/authority-manager2keelson.py"), "-r", REALM, "-e", V, "--zenoh-config", str(zcfg),
              "--state-dir", str(self.tmp / "state"), "--policy", str(policy), "--heartbeat-s", "1", "--gate-timeout-s", "1",
@@ -293,3 +294,44 @@ def test_a_maintenance_act_names_its_maintainer(h, tmp_path):
                        capture_output=True, text=True, timeout=30, check=False)
     assert p.returncode == 2 and "--maintainer" in (p.stdout + p.stderr)
 
+
+
+def test_maintenance_is_entered_on_what_the_manager_hears_and_published(h):
+    from keelson.payloads.MaintenanceState_pb2 import MaintenanceState
+    from keelson.payloads.Primitives_pb2 import TimestampedBool
+    from keelson.payloads.ResolvedControl_pb2 import ControlState, FeedbackQuality, ResolvedControl, ResolvedDof
+
+    records = []
+    h._subs.append(h.session.declare_subscriber(f"{BASE}/maintenance_state/{V}",
+                                                lambda s: records.append(h._decode(s, MaintenanceState))))
+    h.gate.serve()
+    h.policy_extra = {"maintenance": {"vehicle_armed_key": f"{BASE}/vehicle_armed/sim"}}
+    h.start_args = ["--assign-overall", "ted@ROC-1", "--maintainer", "engineer@vessel"]
+    h.start()
+    h.wait(lambda: records and records[-1].state == MaintenanceState.STATE_INACTIVE, what="an INACTIVE record at boot")
+    a = h.call("get", pb.GetAuthorityRequest(), pb.AuthorityState).assignments.overall
+    who = {"controller_id": "ted@ROC-1", "controller_site": "ROC-1", "token": "s1"}
+    r = h.call("renew", pb.RenewRequest(caller=pb.Caller(**who, assignment_id=a.assignment_id), role=Role.ROLE_OVERALL_COMMAND),
+               pb.AuthorityReply)
+    assert r.result == CommandResult.COMMAND_RESULT_ACCEPTED, r.detail
+    c = pb.Caller(**who, assignment_id=a.assignment_id, assignment_revision=a.revision)
+    r = h.call("request_maintenance", pb.RequestMaintenanceRequest(caller=c, maintainer="anna@workshop", reason="firmware",
+                                                                   scopes=[MaintenanceState.SCOPE_FIRMWARE]),
+               pb.MaintenanceReply)
+    assert r.result == CommandResult.COMMAND_RESULT_ACCEPTED, r.detail
+    h.wait(lambda: records[-1].state == MaintenanceState.STATE_REQUESTED, what="REQUESTED published")
+    assert not records[-1].guards[0].satisfied  # nothing heard yet
+
+    def feed():
+        h.session.put(f"{BASE}/vehicle_armed/sim", keelson.enclose(TimestampedBool(value=False).SerializeToString()))
+        rc = ResolvedControl(vessel_id=V, dofs=[ResolvedDof(dof=d, actual_pct=0.0, actual_age_ms=50,
+                                                            feedback_quality=FeedbackQuality.FEEDBACK_QUALITY_VALID,
+                                                            control_state=ControlState.CONTROL_STATE_TRANSITION)
+                                                for d in DOFS])
+        h.session.put(f"{BASE}/resolved_control/{V}", keelson.enclose(rc.SerializeToString()))
+        return records[-1].state == MaintenanceState.STATE_MAINTENANCE
+
+    h.wait(feed, what="MAINTENANCE published")
+    states = [rec.state for rec in records]
+    assert MaintenanceState.STATE_PREPARING in states and records[-1].maintainer == "anna@workshop"
+    assert records[-1].revision == 3 and records[-1].manager_id == "authority-manager/0"

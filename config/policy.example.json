@@ -7,5 +7,14 @@
   "lease_ttl_ms": {"conn": 2000, "engineer": 60000, "payload": 5000},
   "session_ttl_ms": 30000,
   "prepare_ttl_ms": 2000,
-  "succession": {"overall": ["chief-officer@ROC-1"], "navigational": "*"}
+  "succession": {"overall": ["chief-officer@ROC-1"], "navigational": "*"},
+  "maintenance": {
+    "rest": {"rudder": "hold"},
+    "zero_tolerance_pct": 1.0,
+    "feedback_max_age_ms": 2000,
+    "input_max_age_ms": 3000,
+    "payloads": [],
+    "required_checks": ["self_test", "configuration_valid"],
+    "vehicle_armed_key": "rise/@v0/usv-alpha/pubsub/vehicle_armed/mavlink"
+  }
 }

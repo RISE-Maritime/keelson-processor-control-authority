@@ -142,3 +142,46 @@ def test_get_and_history(h):
     assert active.new_fence.generation == h.gate.generation and active.at.seconds > 0
     later = h.history(pb.HistoryRequest(after_seq=hist.records[-1].seq))
     assert list(later.records) == []
+
+
+def test_maintenance_through_the_interface(h):
+    from keelson.payloads.MaintenanceState_pb2 import MaintenanceState
+
+    a = _master(h)
+    c = caller(token="s1", assignment_id=a.assignment_id, assignment_revision=a.revision)
+    r = h.request_maintenance(pb.RequestMaintenanceRequest(caller=c, maintainer="anna@workshop", reason="firmware",
+                                                           scopes=[MaintenanceState.SCOPE_FIRMWARE]))
+    assert r.result == ACCEPTED, r.detail
+    assert (r.record.state, r.record.requested_by, list(r.record.scopes)) == (
+        MaintenanceState.STATE_REQUESTED, "ted@ROC-1", [MaintenanceState.SCOPE_FIRMWARE])
+    assert r.record.HasField("issued_at") and r.record.manager_id == "authority-manager/0"
+    assert [(g.name, g.satisfied) for g in r.record.guards][:1] == [("disarmed", False)]
+    assert h.get(pb.GetAuthorityRequest()).maintenance.state == MaintenanceState.STATE_REQUESTED
+    # Refusals are typed, and the record still comes back.
+    again = h.request_maintenance(pb.RequestMaintenanceRequest(caller=c, maintainer="x", reason="y", scopes=[1]))
+    assert (again.result, again.refusal) == (DENIED, pb.Refusal.REFUSAL_GUARD)
+    assert again.record.state == MaintenanceState.STATE_REQUESTED
+    assert h.finish_maintenance(pb.FinishMaintenanceRequest(caller=c)).refusal == pb.Refusal.REFUSAL_GUARD
+    assert h.cancel_maintenance(pb.CancelMaintenanceRequest(caller=c, reason="later")).result == ACCEPTED
+    assert h.get(pb.GetAuthorityRequest()).maintenance.state == MaintenanceState.STATE_INACTIVE
+
+
+def test_an_unspecified_or_unknown_scope_is_refused_never_dropped(h):
+    a = _master(h)
+    c = caller(token="s1", assignment_id=a.assignment_id, assignment_revision=a.revision)
+    for scopes in ([0], [1, 99]):
+        r = h.request_maintenance(pb.RequestMaintenanceRequest(caller=c, maintainer="anna", reason="x", scopes=scopes))
+        assert r.refusal == pb.Refusal.REFUSAL_MALFORMED, scopes
+
+
+def test_resolved_control_is_read_absent_as_absent(h):
+    from keelson.payloads.ResolvedControl_pb2 import ControlState, FeedbackQuality, ResolvedControl, ResolvedDof
+
+    rc = ResolvedControl(dofs=[ResolvedDof(dof="rudder", actual_pct=0.0, actual_age_ms=40,
+                                           feedback_quality=FeedbackQuality.FEEDBACK_QUALITY_VALID,
+                                           control_state=ControlState.CONTROL_STATE_TRANSITION),
+                               ResolvedDof(dof="throttle_port")])
+    h.observe_resolved(rc)
+    got = h.m.heard.resolved
+    assert got["rudder"] == model.DofReading(0.0, "VALID", 40, "TRANSITION")
+    assert got["throttle_port"] == model.DofReading(None, "UNSPECIFIED", None, "UNSPECIFIED")
