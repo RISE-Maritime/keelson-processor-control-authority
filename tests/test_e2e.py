@@ -365,3 +365,70 @@ def test_an_operational_vessel_refuses_an_unattested_call_and_takes_an_attested_
     assert r.result == CommandResult.COMMAND_RESULT_ACCEPTED, r.detail
     hist = h.call("history", pb.HistoryRequest(), pb.HistoryReply)
     assert any("roc1-authority" in rec.detail_json for rec in hist.records if rec.event == "active")
+
+
+# ---------------------------------------------------------------------------- MIGRATION: vehicle_control (crowsnest-dev#269)
+
+VEHICLE_CONTROL = {
+    "responder": "fake-vehicle",
+    "axes": {"rudder": "steering", "throttle": "throttle"},
+    "sources": [{"execution_source": f"ROC-1/helm-1/{d}", "dof": d, "entity_id": "ROC-1",
+                 "subject": "wheel_position_pct" if d == "rudder" else "lever_position_pct", "source_id": "helm-1"}
+                for d in DOFS],
+}
+
+
+class VehicleServer:
+    """A vessel's vehicle_control/v1, in this test process: it records every mapping it is told."""
+
+    def __init__(self, session):
+        from keelson.interfaces.VehicleControl_pb2 import ControlAxisMapping, ControlAxisMappingAck
+
+        self.mappings = []
+
+        def _set(op):
+            msg = ControlAxisMapping()
+            msg.ParseFromString(op.request_bytes)
+            self.mappings.append({axis: (a.entity_id, a.subject, a.source_id) for axis, a in msg.axes.items()})
+            op.reply_ok(ControlAxisMappingAck())
+
+        self.server = serve_rpc(session, base_path=REALM, entity_id=V, responder_id="fake-vehicle",
+                                interface="vehicle_control", version="v1", handlers={"set_control_mapping": _set})
+
+
+def test_with_the_flag_a_take_installs_the_rows_on_the_vessel_and_a_release_clears_them(h):
+    vessel = VehicleServer(h.session)
+    h.gate.serve()
+    h.policy_extra = {"vehicle_control": VEHICLE_CONTROL}
+    h.start_args = ["--compile-to-vehicle-control"]
+    h.start()
+    h.wait(lambda: vessel.mappings == [{}], what="the boot clear")
+    r = h.take_conn()
+    assert r.result == CommandResult.COMMAND_RESULT_ACCEPTED, r.detail
+    h.wait(lambda: len(vessel.mappings) == 2, what="the install")
+    assert vessel.mappings[-1] == {"steering": ("ROC-1", "wheel_position_pct", "helm-1"),
+                                   "throttle": ("ROC-1", "lever_position_pct", "helm-1")}
+    rel = h.call("release", pb.ReleaseRequest(caller=pb.Caller(controller_id="ted@ROC-1", controller_site="ROC-1",
+                                                               token=r.record.token), role=Role.ROLE_CONN), pb.AuthorityReply)
+    assert rel.result == CommandResult.COMMAND_RESULT_ACCEPTED, rel.detail
+    h.wait(lambda: vessel.mappings[-1] == {} and len(vessel.mappings) == 3, what="the clear on release")
+
+
+def test_without_the_flag_the_vessel_hears_nothing(h):
+    vessel = VehicleServer(h.session)
+    h.gate.serve()
+    h.policy_extra = {"vehicle_control": VEHICLE_CONTROL}
+    h.start()
+    assert h.take_conn().result == CommandResult.COMMAND_RESULT_ACCEPTED
+    time.sleep(1.5)
+    assert vessel.mappings == []
+
+
+@pytest.mark.parametrize("extra, why", [({}, "needs the policy's vehicle_control table"),
+                                        ({"vehicle_control": {**VEHICLE_CONTROL, "axes": {"rudder": "steering"}}},
+                                         "no vehicle_control axis for throttle")])
+def test_the_flag_refuses_to_start_on_a_table_that_cannot_drive_the_helm(h, extra, why):
+    h.policy_extra = extra
+    h.start_args = ["--compile-to-vehicle-control"]
+    with pytest.raises(AssertionError, match=why):
+        h.start()

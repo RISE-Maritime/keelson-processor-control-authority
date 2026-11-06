@@ -1,0 +1,18 @@
+{
+  "command_profile": "test",
+  "dofs": ["rudder", "throttle"],
+  "automation_sources": ["navigation/0"],
+  "processes": ["navigation/0@usv-alpha"],
+  "lease_ttl_ms": {"conn": 2000, "engineer": 60000, "payload": 5000},
+  "succession": {"overall": ["chief-officer@ROC-1"], "navigational": "*"},
+  "vehicle_control": {
+    "responder": "mavlink",
+    "axes": {"rudder": "steering", "throttle": "throttle"},
+    "sources": [
+      {"execution_source": "ROC-1/helm-1/rudder", "dof": "rudder", "entity_id": "ROC-1", "subject": "wheel_position_pct", "source_id": "helm-1"},
+      {"execution_source": "ROC-1/helm-1/throttle", "dof": "throttle", "entity_id": "ROC-1", "subject": "lever_position_pct", "source_id": "helm-1"}
+    ],
+    "min_interval_s": 0.05,
+    "max_axis_age_s": 1.0
+  }
+}

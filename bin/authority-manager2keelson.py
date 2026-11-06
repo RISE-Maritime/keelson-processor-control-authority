@@ -10,6 +10,10 @@ Boot: open the store (an untrusted one stops the process) → rebase every lease
 gate (until it answers, every transfer is refused NOT_RECONCILED) → republish every record → serve
 the interface → liveliness → one loop for expiry and the feed's heartbeat. Every request is decided
 under one lock (control_authority/rpc.py).
+
+MIGRATION, off by default: with `--compile-to-vehicle-control` it also installs the committed map on the
+vessel's own `vehicle_control/v1 set_control_mapping`, through the policy's `vehicle_control` table, and
+clears it on release, abort and lapse (control_authority/vehicle_control.py, crowsnest-dev#269).
 """
 
 import argparse
@@ -38,6 +42,7 @@ from control_authority.rpc import Handlers
 from control_authority.service import Manager
 from control_authority.store import Store
 from control_authority.zenoh_gate import ZenohGate
+from control_authority.zenoh_vehicle_control import ZenohVehicleControl
 
 log = logging.getLogger("authority-manager")
 
@@ -75,6 +80,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--assign-overall", metavar="PRINCIPAL",
                    help="MAINTENANCE: bootstrap OVERALL_COMMAND to PRINCIPAL when nobody holds it (audited; needs --maintainer)")
     p.add_argument("--maintainer", metavar="WHO", help="who performs a maintenance act, recorded in the audit")
+    p.add_argument("--compile-to-vehicle-control", action="store_true",
+                   help="MIGRATION PATH, off by default: install the committed map on the vessel's vehicle_control/v1 "
+                        "set_control_mapping (the policy's vehicle_control table) and clear it on release/abort/lapse")
+    p.add_argument("--vehicle-control-timeout-s", type=float, default=1.0,
+                   help="Timeout of each set_control_mapping call (default 1 s)")
     return p
 
 
@@ -86,6 +96,18 @@ def main() -> int:
     base = f"{realm}/@v0/{vessel}/pubsub"
     policy = load(args.policy)
     log.info("profile %s, %d DOF(s): %s", policy.command_profile, len(policy.dofs), ", ".join(policy.dofs))
+    vcp = policy.vehicle_control
+    if args.compile_to_vehicle_control:
+        # A helm whose full map could never compile is a configuration error: say so at load, not at sea.
+        if vcp is None:
+            log.error("refusing to start: --compile-to-vehicle-control needs the policy's vehicle_control table")
+            return 2
+        unaxed = [d for d in policy.dofs if d not in vcp.axes]
+        if unaxed:
+            log.error("refusing to start: --compile-to-vehicle-control, but no vehicle_control axis for %s", ", ".join(unaxed))
+            return 2
+        log.warning("MIGRATION PATH: the committed map is installed on %s's vehicle_control/v1 (%s)", vcp.responder,
+                    ", ".join(f"{d}->{a}" for d, a in vcp.axes.items()))
 
     conf = create_zenoh_config(args.mode, args.connect, args.listen, zenoh_config=args.zenoh_config)
     with zenoh.open(conf) as session:
@@ -118,8 +140,10 @@ def main() -> int:
                                                     priority=Alarm.Priority.PRIORITY_WARNING))
 
         gate = ZenohGate(session, realm=realm, vessel_id=vessel, responder_id=args.gate_responder_id, timeout_s=args.gate_timeout_s)
+        vehicle = (ZenohVehicleControl(session, realm=realm, vessel_id=vessel, vcp=vcp, timeout_s=args.vehicle_control_timeout_s)
+                   if args.compile_to_vehicle_control else None)
         manager = Manager(store=Store(args.state_dir / "authority.sqlite"), policy=policy, vessel_id=vessel, gate=gate,
-                          publish=publish)
+                          publish=publish, vehicle=vehicle)
         manager.boot()
         log.info("booted: %s, %d lease(s), fence %s", "reconciled" if manager.state.reconciled else "NOT reconciled (gate silent)",
                  len(manager.state.leases), manager.state.in_force.fence)

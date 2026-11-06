@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .attestation import parse_keys
 from .model import CONN, ENGINEER, HOLD, PAYLOAD, PROFILES_ALLOWED, ZERO, MaintenancePolicy, Policy
+from .vehicle_control import AxisSource, VehicleControlPolicy
 
 
 def _maintenance(d: dict, dofs: tuple) -> MaintenancePolicy:
@@ -31,6 +32,35 @@ def _maintenance(d: dict, dofs: tuple) -> MaintenancePolicy:
         required_checks=checks,
         armed_key=str(d.get("vehicle_armed_key", "")),
     )
+
+
+def _vehicle_control(d: dict | None, dofs: tuple) -> VehicleControlPolicy | None:
+    """The migration table (vehicle_control.py). Optional: only `--compile-to-vehicle-control` reads it."""
+    if d is None:
+        return None
+    responder = str(d.get("responder") or "")
+    if not responder:
+        raise ValueError("vehicle_control.responder names the vessel's vehicle_control/v1 responder")
+    axes = {str(k): str(v) for k, v in (d.get("axes") or {}).items()}
+    for dof in axes:
+        if dof not in dofs:
+            raise ValueError(f"vehicle_control.axes names a DOF the vessel does not have: {dof}")
+    shared = sorted({a for a in axes.values() if list(axes.values()).count(a) > 1})
+    if shared:
+        raise ValueError(f"vehicle_control.axes drives one axis from two DOFs: {', '.join(shared)}")
+    sources = {}
+    for row in d.get("sources") or ():
+        key = (str(row.get("execution_source") or ""), str(row.get("dof") or ""))
+        if not key[0] or key[1] not in dofs:
+            raise ValueError(f"vehicle_control.sources: {key} needs an execution_source and a DOF of this vessel")
+        if key in sources:
+            raise ValueError(f"vehicle_control.sources names {key} twice")
+        if not row.get("subject"):
+            raise ValueError(f"vehicle_control.sources: {key} names no subject")
+        sources[key] = AxisSource(str(row.get("entity_id") or ""), str(row["subject"]), str(row.get("source_id") or ""),
+                                  bool(row.get("unipolar", False)), bool(row.get("invert", False)))
+    return VehicleControlPolicy(responder, axes, sources, float(d.get("min_interval_s", 0.0)),
+                                float(d.get("max_axis_age_s", 0.0)))
 
 
 def parse(d: dict) -> Policy:
@@ -68,6 +98,7 @@ def parse(d: dict) -> Policy:
         attestation_keys=keys,
         attestation_required=required,
         challenge_ttl_ms=int(att.get("challenge_ttl_ms", 15000)),
+        vehicle_control=_vehicle_control(d.get("vehicle_control"), dofs),
     )
 
 

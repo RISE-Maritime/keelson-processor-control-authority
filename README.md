@@ -13,7 +13,9 @@ and ACKs with it, and only a COMMIT that the manager has already written to its 
 - **Design:** crowsnest-dev `docs/COMMAND-ARCHITECTURE.md` §0, §4 and §5. The work item is crowsnest-dev #84.
 - **Replaces** `keelson-processor-supervisor`'s `authority.py` (`open` / `exclusive`, single station).
 
-> **Status: built and tested against a fake gate. It actuates nothing.** The motion gate it calls
+> **Status: built and tested against a fake gate. It actuates nothing**, except with
+> `--compile-to-vehicle-control`, the off-by-default migration path that installs the committed map
+> on the vessel's `vehicle_control/v1` (below). The motion gate it calls
 > (crowsnest-dev #85) does not exist yet. Until it does, every transfer is refused NOT_RECONCILED,
 > because the gate never answers. Never run this against a real vessel or a shared network.
 
@@ -136,7 +138,8 @@ re-initialising a store, which would reconcile everything from the gate, is not 
 | serves `authority_manager/v1` as responder `authority-manager` | `command_authority/{vessel}` (the conn), `…/{vessel}/engineer`, `…/{vessel}/payload/{id}`, `…/{vessel}/overall[/session]`, `…/{vessel}/navigational[/session]`, `…/{vessel}/navigation` |
 | calls `control_gate/v1` on responder `control-gate` (`--gate-responder-id`) | `command_assignment/{vessel}`, on every change and at `--heartbeat-s` |
 | hears `resolved_control/{vessel}` and the `maintenance.vehicle_armed_key` | `maintenance_state/{vessel}`, on every transition and guard change, and at `--heartbeat-s` |
-| | `alarm/authority-manager`: a lapsed session, a succession, a reconcile disagreement, an unapplied transfer |
+| with `--compile-to-vehicle-control` only: calls `vehicle_control/v1 set_control_mapping` on `vehicle_control.responder` | |
+| | `alarm/authority-manager`: a lapsed session, a succession, a reconcile disagreement, an unapplied transfer, a map that did not compile into or reach vehicle_control |
 | | liveliness: the source token, the RPC interface token, and the pubsub subjects |
 
 Every record is republished at boot, so the router's storage agrees with the store. One lock decides:
@@ -160,6 +163,44 @@ when nobody holds it**.
 - It is audited as `bootstrap_overall` with the maintainer.
 
 Every later change of master goes through a grant or `assume_command`.
+
+## Migration: compiling the map into `vehicle_control/v1` (off by default)
+
+Until the gate's output reaches an actuator, a vessel's own `vehicle_control/v1` mapping
+(mavlink2keelson, Slipway's `sim`) is the only enforcement she has. With
+`--compile-to-vehicle-control`, the manager installs on it exactly the rows it has committed
+(crowsnest-dev#269). **This is the one path by which the manager makes a vessel's helm follow a
+station.** It is labelled as the migration path and is off unless the flag is given.
+
+- **The table is configuration, not a guess.** The policy's `vehicle_control` section holds:
+  - the `responder`;
+  - each DOF's axis name on the vessel (`rudder → steering`);
+  - one `ControlAxis` (`entity_id`, `subject`, `source_id`, `unipolar`, `invert`) per
+    `{execution_source, dof}`.
+
+  See `config/policy.vehicle-control.example.json`. A table that names an unknown DOF, drives one
+  axis from two DOFs, or repeats a row is refused at load. The flag refuses to start without the
+  table, or when any DOF has no axis.
+- **The vessel's mapping is derived from committed state.** It is the map in force, but only while
+  a live CONN lease holds those rows, and empty otherwise. So a take, a grant, a handover and a
+  take-control install the new rows in one atomic call. A release, a lapse and an abort clear them.
+  A map adopted from the gate under an older lease is never installed. The call runs after the
+  store commit, never before it.
+- **A map that does not compile whole is cleared, never partly installed.** These empty the whole
+  mapping, raise one alarm and write an audit (`vehicle_control_uncompilable`):
+  - a row with no source in the table;
+  - a DOF with no axis;
+  - an `execution_envelope` narrower than full travel, or one with a rate limit. vehicle_control
+    enforces neither.
+
+  The gate's transfer stands; the vessel is just not driven through vehicle_control.
+- **Boot and failure.** After the first reconcile, the map a live conn holds is installed again;
+  with no live conn, the mapping is cleared. Until the gate has been read, the manager may clear
+  but never install. A call the vessel does not answer within `--vehicle-control-timeout-s`
+  (default 1 s) raises one alarm per episode and is retried at every tick. Every install and clear
+  is audited (`vehicle_control_installed` / `_cleared` / `_failed`).
+- **Automation rows** (`navigation/0`) compile like any other row, given a source in the table.
+  The navigator publishes no percentage setpoint subject yet, so the example table has none.
 
 ## Developing before the build
 
@@ -194,5 +235,4 @@ pin moves.
   leases. Those transfers need the inherited constraint snapshot and the plant and payload gates.
 - Fencing NAVIGATION_AUTHORITY on take-control and abort. The CONN is fenced; what happens to the
   automation's function assignments is not specified yet.
-- During migration, compiling the map into `vehicle_control/v1 set_control_mapping`.
 - The principal binding (`controller_id` to an authenticated principal).

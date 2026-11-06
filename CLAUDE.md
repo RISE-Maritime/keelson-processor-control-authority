@@ -18,6 +18,9 @@ it is merged or run anywhere but the isolated tests.** Every commit message carr
 - **A bad attestation is never ignored.** If one is present it is verified, whether or not the
   profile requires it, and a refusal names the check. The principal is recorded from the claim,
   never from `controller_id`.
+- **The vessel's vehicle_control mapping is derived, never decided** (migration, `--compile-to-vehicle-control`,
+  `control_authority/vehicle_control.py`). It is the map in force while a live CONN lease holds it, installed
+  after the commit. A map that does not compile whole is cleared, never partly installed. Off by default.
 - **Pure decisions.** `control_authority/model.py` has no clock, no store and no Zenoh; every
   decision is tested there or through service.py against `tests/fakegate.py`.
 - **One lock decides** (rpc.Handlers): every request, tick and heartbeat, gate round trips included.

@@ -27,7 +27,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Protocol
 
-from . import attestation, model
+from . import attestation, model, vehicle_control
 from .model import Decision, Fence, Mapping, Policy, State, Transfer, TransferRequest
 
 log = logging.getLogger(__name__)
@@ -43,6 +43,17 @@ class GateAck:
 
 class GateUnreachable(Exception):
     pass
+
+
+class VehicleControlUnreachable(Exception):
+    pass
+
+
+class VehicleControlPort(Protocol):
+    """`vehicle_control/v1 set_control_mapping` on the vessel (migration, vehicle_control.py). Returns
+    once the vessel acknowledged; raises VehicleControlUnreachable on no answer or an error reply."""
+
+    def set(self, target: vehicle_control.Target) -> None: ...
 
 
 class GatePort(Protocol):
@@ -65,7 +76,7 @@ def wall_ms() -> int:
 class Manager:
     def __init__(self, *, store, policy: Policy, vessel_id: str, gate: GatePort,
                  publish: Callable[[object, State], None], now_ms: Callable[[], int] = mono_ms,
-                 audit_ms: Callable[[], int] = wall_ms):
+                 audit_ms: Callable[[], int] = wall_ms, vehicle: VehicleControlPort | None = None):
         self.store = store
         self.policy = policy
         self.vessel_id = vessel_id
@@ -83,6 +94,15 @@ class Manager:
         self.challenges = attestation.Challenges(policy.challenge_ttl_ms)
         self.seen: dict = {}
         self.principal: dict | None = None
+        # MIGRATION (crowsnest-dev#269): with no port nothing is ever called. `_vc_installed` is what the
+        # vessel last acknowledged -- None at boot, unknown, so the first sync after reconcile installs
+        # the map in force or clears it.
+        if vehicle is not None and policy.vehicle_control is None:
+            raise ValueError("compiling into vehicle_control needs the policy's vehicle_control table")
+        self.vehicle = vehicle
+        self._vc_installed: tuple | None = None  # the axes the vessel last acknowledged
+        self._vc_failing: tuple | None = None  # the axes whose install last failed
+        self._vc_alarmed: tuple = ()  # the problems last alarmed, so an uncompilable map alarms once
 
     # ------------------------------------------------------------------ boot
 
@@ -213,6 +233,7 @@ class Manager:
         self._apply(model.advance_maintenance(self.state, self.policy, self.heard, now, self.audit_ms()))
         if self.guards() != self._published_guards:
             self._publish_maintenance()
+        self._sync_vehicle(retry=True)
 
     def heartbeat(self) -> None:
         self.challenges.rotate(self.now_ms())
@@ -259,4 +280,42 @@ class Manager:
                 self._publish_maintenance()  # with the guards of the state just committed
                 continue
             self._publish(effect, self.state)
+        self._sync_vehicle(retry=False)
         return d
+
+    def _sync_vehicle(self, *, retry: bool) -> None:
+        """Bring the vessel's vehicle_control mapping to the target derived from what has just been
+        COMMITTED (vehicle_control.target), after the commit, never before it. A failed install is
+        retried only from tick(), so a dead responder costs one timeout per tick, and alarms once per
+        episode. Until the gate's state has been read, the target may only clear, never install."""
+        if self.vehicle is None:
+            return
+        vcp = self.policy.vehicle_control
+        t = vehicle_control.target(self.state, vcp, self.now_ms())
+        if t.problems and t.problems != self._vc_alarmed:
+            self._vc_alarmed = t.problems
+            self.store.commit(self.state, (model._audit("vehicle_control_uncompilable", problems=list(t.problems),
+                                                        responder=vcp.responder),), self.audit_ms())
+            self._publish(model.Alarm("the committed map does not compile into vehicle_control, so it is cleared: "
+                                      + "; ".join(t.problems)), self.state)
+        elif not t.problems:
+            self._vc_alarmed = ()
+        if t.axes == self._vc_installed or (t.axes and not self.state.reconciled):
+            return
+        if t.axes == self._vc_failing and not retry:
+            return
+        try:
+            self.vehicle.set(t)
+        except VehicleControlUnreachable as e:
+            if self._vc_failing != t.axes:
+                self.store.commit(self.state, (model._audit("vehicle_control_failed", responder=vcp.responder,
+                                                            axes=vehicle_control.axes_json(t), reason=str(e)),), self.audit_ms())
+                self._publish(model.Alarm(f"vehicle_control on {vcp.responder} did not take the mapping ({e}); retrying"),
+                              self.state)
+            self._vc_failing = t.axes
+            return
+        self._vc_installed, self._vc_failing = t.axes, None
+        event = "vehicle_control_installed" if t.axes else "vehicle_control_cleared"
+        self.store.commit(self.state, (model._audit(event, responder=vcp.responder, axes=vehicle_control.axes_json(t),
+                                                    fence=model._fence_json(self.state.in_force.fence)),), self.audit_ms())
+        log.info("%s on %s: %s", event, vcp.responder, vehicle_control.axes_json(t))

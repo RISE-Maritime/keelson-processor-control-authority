@@ -375,6 +375,8 @@ class Policy:
     attestation_keys: dict = field(default_factory=dict)
     attestation_required: bool = False  # default: command_profile == "operational" (policy.py)
     challenge_ttl_ms: int = 15000
+    # The migration table into the vessel's vehicle_control/v1 (vehicle_control.py), or None.
+    vehicle_control: object = None
 
     def ttl(self, role: str) -> int:
         return int(self.lease_ttl_ms.get(role, 30000))
