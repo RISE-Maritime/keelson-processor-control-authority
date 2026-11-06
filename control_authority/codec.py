@@ -99,6 +99,16 @@ def slot_path(vessel_id: str, slot: str) -> str:
     return vessel_id if slot == model.CONN else f"{vessel_id}/{slot}"
 
 
+def heard_constraint(pb) -> model.HeardConstraint | None:
+    """A `PropulsionConstraint` as the manager hears it (crowsnest-dev#270); None without a fence. Read by
+    field, so this module does not need the type in its SDK."""
+    if not pb.HasField("fence") or not pb.fence.term:
+        return None
+    devices = tuple((d.device_id, d.max_power_pct if d.HasField("max_power_pct") else None, bool(d.inhibit), d.reason)
+                    for d in pb.devices)
+    return model.HeardConstraint(Fence(pb.fence.term, int(pb.fence.generation)), int(pb.revision), pb.controller_id, devices)
+
+
 def lease_record(st: State, slot: str, issuer_id: str, released: bool = False, now: Timestamp | None = None,
                  lease=None) -> CommandAuthority:
     """The `command_authority` record for one slot, as the manager publishes it. A conn record carries
@@ -120,6 +130,9 @@ def lease_record(st: State, slot: str, issuer_id: str, released: bool = False, n
             rec.assignment.CopyFrom(_assignment_to_proto(a))
     if role_name == model.CONN and st.in_force.fence is not None and not released:
         rec.fence.CopyFrom(fence_to_proto(st.in_force.fence))
+    elif role_name in (model.ENGINEER, model.PAYLOAD) and lease is not None and lease.fence is not None and not released:
+        # plant_generation / payload_epoch: what the gate minted for this holder, read back (crowsnest-dev#270).
+        rec.fence.CopyFrom(fence_to_proto(lease.fence))
     if now is not None:
         rec.last_heartbeat.CopyFrom(now)
     return rec

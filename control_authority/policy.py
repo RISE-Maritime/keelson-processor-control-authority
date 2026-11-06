@@ -99,6 +99,8 @@ def parse(d: dict) -> Policy:
         attestation_required=required,
         challenge_ttl_ms=int(att.get("challenge_ttl_ms", 15000)),
         vehicle_control=_vehicle_control(d.get("vehicle_control"), dofs),
+        offer_ttl_ms=int(d.get("offer_ttl_ms", 30000)),
+        payload_gates={str(k): str(v) for k, v in (d.get("payload_gates") or {}).items()},
     )
 
 

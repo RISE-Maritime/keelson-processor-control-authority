@@ -111,9 +111,40 @@ class Lease:
     # Who really took or last renewed it, as the ROC service attested (attestation.py); {} when
     # the call carried no attestation (crowsnest-dev#312).
     principal: dict = field(default_factory=dict)
+    # ENGINEER / PAYLOAD_AUTHORITY: the fence ITS GATE minted for this holder, read back from what the
+    # gate published (plant_generation, payload_epoch; crowsnest-dev#270). Never the manager's own.
+    fence: Fence | None = None
 
     def live(self, now_ms: int) -> bool:
         return now_ms - self.renewed_ms <= self.ttl_ms
+
+
+@dataclass(frozen=True)
+class Offer:
+    """An ENGINEER / PAYLOAD_AUTHORITY handover the holder has offered and the named holder has not yet
+    accepted (crowsnest-dev#270). Accepting it is the incoming holder's own `request` for the role."""
+
+    slot: str
+    from_holder: str
+    from_token: str
+    to_holder: str
+    to_site: str
+    expires_ms: int
+
+
+@dataclass(frozen=True)
+class HeardConstraint:
+    """`propulsion_constraint/{vessel}` as last heard: what an incoming engineer inherits."""
+
+    fence: Fence
+    revision: int
+    controller_id: str
+    devices: tuple = ()  # (device_id, max_power_pct | None, inhibit, reason)
+
+    def describe(self) -> str:
+        parts = [f"{d[0]} {'inhibited' if d[2] else (f'{d[1]:g} %' if d[1] is not None else 'no cap')}" for d in self.devices]
+        return (f"{', '.join(parts) or 'no device constrained'} (revision {self.revision} under plant_generation "
+                f"{self.fence.generation}, by {self.controller_id})")
 
 
 @dataclass(frozen=True)
@@ -240,6 +271,10 @@ class Heard:
     resolved_ms: int | None = None
     # payload_id -> True when it reports its safe state. Nothing reports one yet (keelson#372).
     payload_safe: dict = field(default_factory=dict)
+    # The plant constraint in force (crowsnest-dev#270). `constraint_read` is False until storage has
+    # been asked, so "none in force" is never confused with "not read yet".
+    constraint: HeardConstraint | None = None
+    constraint_read: bool = False
 
 
 @dataclass(frozen=True)
@@ -265,6 +300,7 @@ class State:
     in_force: InForce = field(default_factory=InForce)
     transfers: dict = field(default_factory=dict)  # transfer_id -> Transfer
     maintenance: Maintenance = field(default_factory=Maintenance)
+    offers: dict = field(default_factory=dict)  # slot -> Offer (crowsnest-dev#270)
     # Not persisted: false at every boot until the gate's exposed state has been read (I13).
     reconciled: bool = False
 
@@ -375,6 +411,8 @@ class Policy:
     attestation_keys: dict = field(default_factory=dict)
     attestation_required: bool = False  # default: command_profile == "operational" (policy.py)
     challenge_ttl_ms: int = 15000
+    offer_ttl_ms: int = 30000  # an ENGINEER / PAYLOAD handover offer, until the named holder accepts
+    payload_gates: dict = field(default_factory=dict)  # payload_id -> its payload_control/v1 responder
     # The migration table into the vessel's vehicle_control/v1 (vehicle_control.py), or None.
     vehicle_control: object = None
 
@@ -389,21 +427,73 @@ class Policy:
 
 
 def take_lease(state: State, policy: Policy, role: str, principal: str, site: str, now_ms: int,
-               payload_id: str = "", token: str | None = None) -> Decision:
-    """ENGINEER and PAYLOAD_AUTHORITY: a fresh lease on a free slot. The CONN is never taken here: a
-    conn is a motion transfer (`begin_transfer` GRANT), because its DOFs move with it."""
+               payload_id: str = "", token: str | None = None, inherits: str = "") -> Decision:
+    """ENGINEER and PAYLOAD_AUTHORITY: a fresh lease on a free slot, or ACCEPTING the holder's offer
+    (crowsnest-dev#270). The CONN is never taken here: a conn is a motion transfer (`begin_transfer`
+    GRANT), because its DOFs move with it.
+
+    Either way the new lease carries a token its gate has not seen, and that is the change of holder
+    the gate observes: the motion gate mints the next plant_generation and rebases the constraint in
+    force onto it at revision 1; the payload gate mints the next payload_epoch. The manager authorises;
+    it mints nothing. `inherits` names the plant constraint the incoming engineer takes over."""
     if role not in (ENGINEER, PAYLOAD) or (role == PAYLOAD and not payload_id):
         return _same(state, REFUSED_MALFORMED, "only ENGINEER and PAYLOAD_AUTHORITY are taken directly; the conn is a transfer")
     if role == PAYLOAD and state.maintenance.state in IN_MAINTENANCE:
         return _same(state, REFUSED_MAINTENANCE, f"the vessel is {state.maintenance.state.upper()}: no payload authority until INACTIVE")
     slot = slot_of(role, payload_id)
     held = state.live_lease(slot, now_ms)
-    if held is not None and held.holder != principal:
-        return _same(state, REFUSED_HELD, f"held by {held.holder}: request it from them")
+    offer = state.offers.get(slot)
+    handover = (held is not None and held.holder != principal and offer is not None and offer.to_holder == principal
+                and offer.from_token == held.token and now_ms <= offer.expires_ms)
+    if held is not None and held.holder != principal and not handover:
+        return _same(state, REFUSED_HELD, f"held by {held.holder}: they offer it with a transfer, then you request it")
     tok = token or new_id()
     lease = Lease(slot, principal, site, tok, tok, now_ms, policy.ttl(role))
-    st = replace(state, leases={**state.leases, slot: lease})
-    return Decision(st, ACCEPTED, "", (PublishLease(slot),), (_audit("take", slot=slot, holder=principal, site=site),))
+    offers = {k: o for k, o in state.offers.items() if k != slot}
+    st = replace(state, leases={**state.leases, slot: lease}, offers=offers)
+    if handover:
+        detail = f"taken over from {held.holder}" + (f"; inherits {inherits}" if role == ENGINEER else "")
+        return Decision(st, ACCEPTED, detail, (PublishLease(slot),),
+                        (_audit("handed_over", slot=slot, holder=principal, site=site, previous=held.holder,
+                                inherits=inherits if role == ENGINEER else ""),))
+    detail = f"inherits {inherits}" if role == ENGINEER and inherits else ""
+    return Decision(st, ACCEPTED, detail, (PublishLease(slot),),
+                    (_audit("take", slot=slot, holder=principal, site=site, inherits=inherits if role == ENGINEER else ""),))
+
+
+def offer_lease(state: State, policy: Policy, role: str, payload_id: str, requester: str, token: str, to: str, to_site: str,
+                now_ms: int) -> Decision:
+    """The ENGINEER / PAYLOAD_AUTHORITY holder offers the role to a named holder (crowsnest-dev#270). Nothing
+    moves until they accept it with their own `request`; the offer lapses after `offer_ttl_ms`, and with the
+    offering lease."""
+    if role not in (ENGINEER, PAYLOAD) or (role == PAYLOAD and not payload_id):
+        return _same(state, REFUSED_MALFORMED, "only ENGINEER and PAYLOAD_AUTHORITY are offered")
+    if role == PAYLOAD and state.maintenance.state in IN_MAINTENANCE:
+        return _same(state, REFUSED_MAINTENANCE, f"the vessel is {state.maintenance.state.upper()}: no payload authority until INACTIVE")
+    slot = slot_of(role, payload_id)
+    held = state.live_lease(slot, now_ms)
+    if held is None or held.token != token or held.holder != requester:
+        return _same(state, REFUSED_UNAUTHORISED, "only the holder offers the role, with their lease's token")
+    if not to or to == requester:
+        return _same(state, REFUSED_MALFORMED, "an offer names someone else to take the role")
+    offer = Offer(slot, requester, token, to, to_site, now_ms + policy.offer_ttl_ms)
+    st = replace(state, offers={**state.offers, slot: offer})
+    return Decision(st, ACCEPTED, f"offered to {to}: they accept by requesting the role within {policy.offer_ttl_ms // 1000} s",
+                    (), (_audit("offered", slot=slot, holder=requester, to=to, to_site=to_site),))
+
+
+def record_fence(state: State, slot: str, fence: Fence) -> Decision:
+    """The gate's fence for the holder of an ENGINEER / PAYLOAD_AUTHORITY lease, as the gate published
+    it, onto the lease record. Never a fence of the manager's own; a stale one never replaces a newer."""
+    lease = state.leases.get(slot)
+    if lease is None or lease.fence == fence:
+        return _same(state, ACCEPTED)
+    old = lease.fence
+    if old is not None and old.term == fence.term and fence.generation <= old.generation:
+        return _same(state, ACCEPTED)
+    st = replace(state, leases={**state.leases, slot: replace(lease, fence=fence)})
+    return Decision(st, ACCEPTED, "", (PublishLease(slot),),
+                    (_audit("fence_recorded", slot=slot, holder=lease.holder, fence=_fence_json(fence)),))
 
 
 def renew(state: State, slot: str, token: str, now_ms: int) -> Decision:
@@ -425,7 +515,8 @@ def release(state: State, slot: str, token: str) -> Decision:
         return _same(state, REFUSED_UNAUTHORISED, "not this lease's token")
     leases = dict(state.leases)
     del leases[slot]
-    return Decision(replace(state, leases=leases), ACCEPTED, "", (PublishLease(slot, True, lease),),
+    offers = {k: o for k, o in state.offers.items() if k != slot}  # an offer ends with its lease
+    return Decision(replace(state, leases=leases, offers=offers), ACCEPTED, "", (PublishLease(slot, True, lease),),
                     (_audit("release", slot=slot, holder=lease.holder),))
 
 
@@ -433,7 +524,13 @@ def expire(state: State, now_ms: int) -> Decision:
     """Lapsed leases vacate their role and are published released. A lapsed SESSION means the
     assignee is unreachable: it alarms and vacates nothing (the assignment stands)."""
     lapsed = [s for s, lease in state.leases.items() if not lease.live(now_ms)]
+    # An offer ends when it expires, or with the lease that made it.
+    offers = {k: o for k, o in state.offers.items()
+              if now_ms <= o.expires_ms and k not in lapsed and getattr(state.leases.get(k), "token", None) == o.from_token}
     if not lapsed:
+        if offers != state.offers:
+            return Decision(replace(state, offers=offers), ACCEPTED, "", (),
+                            tuple(_audit("offer_ended", slot=k) for k in state.offers if k not in offers))
         return _same(state, ACCEPTED)
     leases = {s: lease for s, lease in state.leases.items() if s not in lapsed}
     effects, audits = [], []
@@ -443,7 +540,7 @@ def expire(state: State, now_ms: int) -> Decision:
         if s.endswith("/session"):
             role = s.split("/")[0]
             effects.append(Alarm(f"{role.upper()} assignee {state.leases[s].holder} is unreachable: their session lapsed"))
-    return Decision(replace(state, leases=leases), ACCEPTED, "", tuple(effects), tuple(audits))
+    return Decision(replace(state, leases=leases, offers=offers), ACCEPTED, "", tuple(effects), tuple(audits))
 
 
 def rebase_after_restart(state: State, now_ms: int) -> State:

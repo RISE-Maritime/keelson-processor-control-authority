@@ -42,6 +42,7 @@ from control_authority.rpc import Handlers
 from control_authority.service import Manager
 from control_authority.store import Store
 from control_authority.zenoh_gate import ZenohGate
+from control_authority.zenoh_payload_gate import ZenohPayloadGates
 from control_authority.zenoh_vehicle_control import ZenohVehicleControl
 
 log = logging.getLogger("authority-manager")
@@ -142,8 +143,11 @@ def main() -> int:
         gate = ZenohGate(session, realm=realm, vessel_id=vessel, responder_id=args.gate_responder_id, timeout_s=args.gate_timeout_s)
         vehicle = (ZenohVehicleControl(session, realm=realm, vessel_id=vessel, vcp=vcp, timeout_s=args.vehicle_control_timeout_s)
                    if args.compile_to_vehicle_control else None)
+        # The payload fence read back (crowsnest-dev#270): only for the payloads the policy names a gate for.
+        payload_gates = (ZenohPayloadGates(session, realm=realm, vessel_id=vessel, responders=policy.payload_gates)
+                         if policy.payload_gates else None)
         manager = Manager(store=Store(args.state_dir / "authority.sqlite"), policy=policy, vessel_id=vessel, gate=gate,
-                          publish=publish, vehicle=vehicle)
+                          publish=publish, vehicle=vehicle, payload_gates=payload_gates)
         manager.boot()
         log.info("booted: %s, %d lease(s), fence %s", "reconciled" if manager.state.reconciled else "NOT reconciled (gate silent)",
                  len(manager.state.leases), manager.state.in_force.fence)
@@ -187,6 +191,27 @@ def main() -> int:
             handlers.observe_resolved(rc)
 
         subs = [session.declare_subscriber(f"{base}/resolved_control/{vessel}", heard(on_resolved))]
+        # What an incoming engineer inherits, and the plant_generation the gate minted for them
+        # (crowsnest-dev#270). Read by type name: not every SDK this is developed against carries it.
+        try:
+            constraint_cls = keelson.get_protobuf_message_class_from_type_name("keelson.PropulsionConstraint")
+        except KeyError:
+            constraint_cls = None
+        if constraint_cls is None:
+            log.warning("this keelson has no PropulsionConstraint: an engineer handover cannot name what it inherits")
+        else:
+            def on_constraint(raw: bytes) -> None:
+                pc = constraint_cls()
+                pc.ParseFromString(raw)
+                handlers.observe_constraint(pc)
+
+            key = f"{base}/propulsion_constraint/{vessel}"
+            stored = [r.ok for r in session.get(key, timeout=2.0) if r.ok is not None]
+            for sample in stored:
+                heard(on_constraint)(sample)
+            if not stored:
+                handlers.observe_constraint(None)  # storage was asked and holds none: "none in force", not "unread"
+            subs.append(session.declare_subscriber(key, heard(on_constraint)))
         if policy.maintenance.armed_key:
             subs.append(session.declare_subscriber(policy.maintenance.armed_key, heard(on_armed)))
         else:

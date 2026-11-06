@@ -125,9 +125,20 @@ def test_navigation_authority_through_the_interface(h):
     assert h.m.state.navigation["track_keeping"].envelope == {"reroute_allowed": True}
 
 
-def test_engineer_handover_is_a_typed_limitation_never_silence(h):
-    r = h.transfer(pb.TransferRoleRequest(caller=caller(), role=Role.ROLE_ENGINEER, new_holder="eng@vessel"))
-    assert r.result == CommandResult.COMMAND_RESULT_UNSUPPORTED and r.detail
+def test_an_engineer_handover_is_an_offer_then_the_incoming_holders_request(h):
+    anna = h.request(pb.RequestRoleRequest(caller=caller("anna@ECR", "ECR"), role=Role.ROLE_ENGINEER))
+    assert anna.result == ACCEPTED, anna.detail
+    # Bo cannot simply take it...
+    assert h.request(pb.RequestRoleRequest(caller=caller("bo@ECR", "ECR"), role=Role.ROLE_ENGINEER)).refusal == pb.Refusal.REFUSAL_HELD
+    # ...Anna offers it, and nothing moves until Bo accepts.
+    off = h.transfer(pb.TransferRoleRequest(caller=caller("anna@ECR", "ECR", token=anna.record.token), role=Role.ROLE_ENGINEER,
+                                            new_holder="bo@ECR", new_holder_site="ECR"))
+    assert off.result == ACCEPTED and "offered to bo@ECR" in off.detail and off.record.controller_id == "anna@ECR"
+    bo = h.request(pb.RequestRoleRequest(caller=caller("bo@ECR", "ECR"), role=Role.ROLE_ENGINEER))
+    assert bo.result == ACCEPTED and "taken over from anna@ECR" in bo.detail and "inherits" in bo.detail
+    assert bo.record.controller_id == "bo@ECR" and bo.record.token != anna.record.token
+    # The conn is never offered this way.
+    assert h.transfer(pb.TransferRoleRequest(caller=caller(), role=Role.ROLE_UNSPECIFIED)).refusal == pb.Refusal.REFUSAL_MALFORMED
 
 
 def test_get_and_history(h):

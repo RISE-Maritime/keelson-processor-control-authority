@@ -164,6 +164,42 @@ when nobody holds it**.
 
 Every later change of master goes through a grant or `assume_command`.
 
+## ENGINEER and PAYLOAD_AUTHORITY: offered, accepted, minted by their gates
+
+A change of ENGINEER holder moves `plant_generation`, and a change of PAYLOAD_AUTHORITY holder moves
+that payload's `payload_epoch` (COMMAND-ARCHITECTURE §1.1/§1.2, I16; crowsnest-dev#270). **The
+manager authorises the change; the gates mint the fences.** No new protocol is involved.
+
+- **Offer, then accept.**
+  - The holder `transfer`s the role to a named holder. That records an OFFER, and nothing moves.
+  - The named holder's own `request` for the role accepts it, within `offer_ttl_ms` (default 30 s).
+    The manager then commits a new lease with a fresh token.
+  - Anyone else's `request` on a held slot is still REFUSED_HELD.
+  - An offer ends when it expires, or when the offering lease is released or lapses.
+  - A free slot is taken as before.
+- **The new token is the change the gate observes.**
+  - The motion gate mints the next `plant_generation`. It rebases the constraint in force onto
+    it, unchanged, at revision 1, and publishes it, so the incoming engineer inherits it and can
+    never relax it.
+  - A payload's gate mints the next `payload_epoch`.
+  - Neither is a motion transfer: the helm's fence does not move.
+- **The incoming engineer is told what they inherit.** The reply and the `handed_over` audit name
+  the constraint in force: the devices, the revision, the plant generation and the writer. The
+  manager hears it on `propulsion_constraint/{vessel}`, after a storage read at boot, so "no
+  constraint in force" is never confused with "not read yet".
+- **The fence is read back, never made.**
+  - **ENGINEER:** when the gate publishes a constraint written for the engineer holder, its fence
+    goes on their `command_authority` record.
+  - **PAYLOAD_AUTHORITY:** for each payload whose gate the policy names (`payload_gates`:
+    `payload_id → responder`), the manager calls `payload_control/v1 get_payload_mapping` at each
+    tick. It records the epoch only once the gate shows one newer than what it showed just before
+    the new lease went out.
+  - **When nothing is recorded:** if the gate did not answer then, or the manager has restarted
+    since, nothing is recorded for that holder. An epoch whose owner cannot be told is never
+    named as theirs.
+  - **With no constraint in force,** the gate publishes nothing for a new engineer, so their record
+    carries no fence until a constraint is written.
+
 ## Migration: compiling the map into `vehicle_control/v1` (off by default)
 
 Until the gate's output reaches an actuator, a vessel's own `vehicle_control/v1` mapping
@@ -231,8 +267,6 @@ pin moves.
 ## Not in this cut
 
 - Audit records on a subject of their own: `history` serves them from the store.
-- The ENGINEER and PAYLOAD_AUTHORITY holder changes as gate transfers: today they are plain
-  leases. Those transfers need the inherited constraint snapshot and the plant and payload gates.
 - Fencing NAVIGATION_AUTHORITY on take-control and abort. The CONN is fenced; what happens to the
   automation's function assignments is not specified yet.
 - The principal binding (`controller_id` to an authenticated principal).

@@ -190,10 +190,12 @@ class Handlers:
             if req.role in ASSIGNMENT_ROLE:
                 d = self.m.assign(ASSIGNMENT_ROLE[req.role], req.new_holder, c.controller_id, _revision(c), _token(c))
                 return self._reply(d)
-        # A typed limitation, never silence (serve_rpc's full-interface rule).
-        return AuthorityReply(result=CommandResult.COMMAND_RESULT_UNSUPPORTED, refusal=Refusal.REFUSAL_UNSPECIFIED,
-                              detail="an ENGINEER or PAYLOAD_AUTHORITY handover needs its gate and the inherited "
-                                     "constraint snapshot; not served yet — release and take instead")
+            if req.role in (Role.ROLE_ENGINEER, Role.ROLE_PAYLOAD_AUTHORITY):
+                # An OFFER (crowsnest-dev#270): nothing moves until the named holder accepts with `request`.
+                role = LEASE_ROLE[req.role]
+                d = self.m.offer(role, c.controller_id, req.payload_id, _token(c), req.new_holder, req.new_holder_site)
+                return self._reply(d, model.slot_of(role, req.payload_id))
+        return _denied(Refusal.REFUSAL_MALFORMED, "not a role that is transferred")
 
     @attested("take_control", AuthorityReply)
     def take_control(self, req) -> AuthorityReply:
@@ -298,6 +300,12 @@ class Handlers:
         dofs = codec.resolved_from_proto(rc)
         with self.lock:
             self.m.observe_resolved(dofs)
+
+    def observe_constraint(self, pb) -> None:
+        """`propulsion_constraint/{vessel}`; None when storage holds none (crowsnest-dev#270)."""
+        c = codec.heard_constraint(pb) if pb is not None else None
+        with self.lock:
+            self.m.observe_constraint(c)
 
     def heartbeat(self) -> None:
         with self.lock:

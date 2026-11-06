@@ -56,6 +56,13 @@ class VehicleControlPort(Protocol):
     def set(self, target: vehicle_control.Target) -> None: ...
 
 
+class PayloadGatePort(Protocol):
+    """`payload_control/v1 get_payload_mapping` on a payload's gate: the payload_epoch it shows now, or
+    None when it does not answer (crowsnest-dev#270)."""
+
+    def epoch(self, payload_id: str) -> Fence | None: ...
+
+
 class GatePort(Protocol):
     def prepare(self, transfer: Transfer, prepare_ttl_ms: int) -> GateAck: ...
 
@@ -76,7 +83,8 @@ def wall_ms() -> int:
 class Manager:
     def __init__(self, *, store, policy: Policy, vessel_id: str, gate: GatePort,
                  publish: Callable[[object, State], None], now_ms: Callable[[], int] = mono_ms,
-                 audit_ms: Callable[[], int] = wall_ms, vehicle: VehicleControlPort | None = None):
+                 audit_ms: Callable[[], int] = wall_ms, vehicle: VehicleControlPort | None = None,
+                 payload_gates: PayloadGatePort | None = None):
         self.store = store
         self.policy = policy
         self.vessel_id = vessel_id
@@ -103,6 +111,12 @@ class Manager:
         self._vc_installed: tuple | None = None  # the axes the vessel last acknowledged
         self._vc_failing: tuple | None = None  # the axes whose install last failed
         self._vc_alarmed: tuple = ()  # the problems last alarmed, so an uncompilable map alarms once
+        # The payload fence read back (crowsnest-dev#270): the epoch each payload gate showed just before a
+        # new holder's lease was published, so only a NEWER one is recorded as theirs. Volatile: after a
+        # restart a lease with no fence recorded keeps none, rather than adopting an epoch of unknown owner.
+        self.payload_gates = payload_gates
+        self._payload_baseline: dict = {}  # slot -> the epoch before its current holder, or None (unanswered)
+        self._payload_baseline_token: dict = {}  # slot -> the token that baseline was taken for
 
     # ------------------------------------------------------------------ boot
 
@@ -168,7 +182,27 @@ class Manager:
     # ------------------------------------------------------------------ leases, assignments, navigation
 
     def take(self, role, principal, site, payload_id="", token=None) -> Decision:
-        return self._apply(model.take_lease(self.state, self.policy, role, principal, site, self.now_ms(), payload_id, token))
+        """A free slot, or ACCEPTING the holder's offer (crowsnest-dev#270). An incoming engineer inherits the
+        plant constraint in force; the reply and the audit name it."""
+        inherits = ""
+        if role == model.ENGINEER:
+            c = self.heard.constraint
+            inherits = (c.describe() if c is not None
+                        else "no plant constraint in force" if self.heard.constraint_read else "the plant constraint, not read yet")
+        return self._apply(model.take_lease(self.state, self.policy, role, principal, site, self.now_ms(), payload_id, token,
+                                            inherits))
+
+    def offer(self, role, principal, payload_id, token, to, to_site) -> Decision:
+        return self._apply(model.offer_lease(self.state, self.policy, role, payload_id, principal, token, to, to_site,
+                                             self.now_ms()))
+
+    def observe_constraint(self, c: model.HeardConstraint | None) -> None:
+        """`propulsion_constraint/{vessel}` (None: storage holds none). When the gate has published one for
+        the ENGINEER holder, its fence -- the plant_generation it minted for them -- goes on their record."""
+        self.heard = replace(self.heard, constraint=c, constraint_read=True)
+        eng = self.state.live_lease(model.slot_of(model.ENGINEER), self.now_ms())
+        if c is not None and eng is not None and c.controller_id == eng.holder:
+            self._apply(model.record_fence(self.state, eng.slot, c.fence))
 
     def renew(self, slot, token) -> Decision:
         return self._apply(model.renew(self.state, slot, token, self.now_ms()))
@@ -234,6 +268,24 @@ class Manager:
         if self.guards() != self._published_guards:
             self._publish_maintenance()
         self._sync_vehicle(retry=True)
+        self._read_payload_fences()
+
+    def _read_payload_fences(self) -> None:
+        """For each payload lease with no fence recorded, ask its gate; record the epoch only if it is newer
+        than the one the gate showed before this holder's lease was published."""
+        if self.payload_gates is None:
+            return
+        for slot, lease in list(self.state.leases.items()):
+            pid = slot.split("/", 1)[1] if slot.startswith("payload/") else ""
+            if not pid or lease.fence is not None or pid not in self.policy.payload_gates or slot not in self._payload_baseline:
+                continue
+            epoch = self.payload_gates.epoch(pid)
+            base = self._payload_baseline[slot]
+            if epoch is None or base is None or (epoch.term == base.term and epoch.generation <= base.generation):
+                # Not seen the new holder yet -- or no baseline (the gate did not answer before the lease was
+                # published), and then no epoch can be told to be theirs: none is recorded.
+                continue
+            self._apply(model.record_fence(self.state, slot, epoch))
 
     def heartbeat(self) -> None:
         self.challenges.rotate(self.now_ms())
@@ -279,6 +331,13 @@ class Manager:
             if isinstance(effect, model.PublishMaintenance):
                 self._publish_maintenance()  # with the guards of the state just committed
                 continue
+            if (isinstance(effect, model.PublishLease) and not effect.released and effect.slot.startswith("payload/")
+                    and self.payload_gates is not None and effect.slot.split("/", 1)[1] in self.policy.payload_gates):
+                lease = self.state.leases.get(effect.slot)
+                if lease is not None and lease.fence is None and self._payload_baseline_token.get(effect.slot) != lease.token:
+                    # Before the gate can see the new token: the epoch it shows now is the previous holder's.
+                    self._payload_baseline[effect.slot] = self.payload_gates.epoch(effect.slot.split("/", 1)[1])
+                    self._payload_baseline_token[effect.slot] = lease.token
             self._publish(effect, self.state)
         self._sync_vehicle(retry=False)
         return d

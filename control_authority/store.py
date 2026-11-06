@@ -31,6 +31,7 @@ from .model import (
     Maintenance,
     Mapping,
     NavFunction,
+    Offer,
     State,
     Succession,
     Transfer,
@@ -89,7 +90,9 @@ def _maintenance(d):
 def state_from_json(d: dict) -> State:
     return State(
         vessel_id=d["vessel_id"],
-        leases={k: Lease(**{**v, "principal": dict(v.get("principal") or {})}) for k, v in d["leases"].items()},
+        # `fence` and `offers` arrived with crowsnest-dev#270; a store written before them has neither.
+        leases={k: Lease(**{**v, "principal": dict(v.get("principal") or {}), "fence": _fence(v.get("fence"))})
+                for k, v in d["leases"].items()},
         overall=_assignment(d["overall"]),
         navigational=_assignment(d["navigational"]),
         navigation={k: NavFunction(v["holder"], v["holder_lease_id"], int(v["method"]), dict(v.get("envelope") or {}))
@@ -103,6 +106,7 @@ def state_from_json(d: dict) -> State:
                                   "principal": dict(v.get("principal") or {})})
                    for k, v in d["transfers"].items()},
         maintenance=_maintenance(d.get("maintenance")),
+        offers={k: Offer(**v) for k, v in (d.get("offers") or {}).items()},
         reconciled=False,
     )
 
