@@ -32,6 +32,7 @@ class FakeGate:
         self.unready: set[str] = set()  # DOFs whose incoming source is neither neutral nor matched
         self.down = False
         self.prepares: list = []  # what it was sent, for assertions
+        self.last_cause = None  # GateState.last_fence_cause (#290): set by fence_alone, cleared by a COMMIT
         self.on_prepare = None  # hooks a test can use to look at the manager's store mid-call
         self.on_commit = None
 
@@ -73,21 +74,25 @@ class FakeGate:
             return False, "no such reservation"
         self.generation = fence.generation
         self.mappings = tuple(replace(m) for m in r.mappings)
+        self.last_cause = None  # a transfer moved the fence: no cause of an older fence survives it
         self.station = r.station
         self.reservation = None
         return True, ""
 
     def exposed(self):
         self._up()
-        return self.fence, self.mappings, self.station
+        return self.fence, self.mappings, self.station, self.last_cause
 
     # ---- what happens to a gate without the manager
 
-    def fence_alone(self):
+    def fence_alone(self, kind="conn_lapse", **who):
         """A CONN lapse, an invalid source, an abort with the manager dead: the gate increments by
-        itself and enters its transition map."""
+        itself, enters its transition map, and records why (`last_cause`, #290)."""
+        from control_authority.model import GateCause
+
         self.generation += 1
         self.mappings = ()
+        self.last_cause = GateCause(kind, self.fence, **who)
 
     def restart(self):
         """The gate restarts with its store intact: the fence it activated survives, any reservation

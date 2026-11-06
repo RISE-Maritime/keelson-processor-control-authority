@@ -148,6 +148,23 @@ class HeardConstraint:
 
 
 @dataclass(frozen=True)
+class GateCause:
+    """keelson GateState.last_fence_cause: why the gate last moved its fence ALONE, with the fence it
+    produced, and for a direct Abort automation who asked (crowsnest-dev#290). The gate clears it on a
+    COMMIT, and it is read only while its fence is the one the gate exposes."""
+
+    kind: str  # "abort_automation" | "conn_lapse" | "invalid_source" | "local_fallback"
+    fence: Fence
+    requested_by: str = ""
+    assignment_id: str = ""
+    assignment_revision: int = 0
+    reason: str = ""
+
+
+GATE_ABORT = "abort_automation"
+
+
+@dataclass(frozen=True)
 class Succession:
     previous_assignee: str
     reason: str
@@ -909,12 +926,18 @@ def _revert_navigation(state: State, policy: Policy, t: Transfer) -> tuple[State
 
     The envelope is kept, so a re-delegation can restore it; at method 2 it grants nothing.
     Functions held by humans are untouched. Returns the new state and the functions reverted."""
+    return _revert_to(state, policy, t.reverts_to, t.reverts_lease_id)
+
+
+def _revert_to(state: State, policy: Policy, who: str, lease_id: str) -> tuple[State, list[str]]:
+    """Every function a software principal holds, to `who` at method 2, with ONE revision bump. Shared by
+    the manager-run abort (`_revert_navigation`) and the one the gate ran alone (`reconcile`, #290)."""
     reverted = sorted(f for f, fn in state.navigation.items() if policy.is_software(fn.holder))
     if not reverted:
         return state, []
     nav = dict(state.navigation)
     for f in reverted:
-        nav[f] = NavFunction(t.reverts_to, t.reverts_lease_id, 2, dict(nav[f].envelope))
+        nav[f] = NavFunction(who, lease_id, 2, dict(nav[f].envelope))
     return replace(state, navigation=nav, navigation_revision=state.navigation_revision + 1), reverted
 
 
@@ -928,7 +951,8 @@ def abandon(state: State, transfer_id: str, why: str) -> Decision:
                     (_audit("abandoned", transfer_id=transfer_id, reason=why),), transfer_id)
 
 
-def reconcile(state: State, policy: Policy, gate_fence: Fence | None, gate_mappings, gate_station: str, now_ms: int) -> Decision:
+def reconcile(state: State, policy: Policy, gate_fence: Fence | None, gate_mappings, gate_station: str, now_ms: int,
+              gate_cause: GateCause | None = None) -> Decision:
     """Before any transfer after a restart, or after a refused COMMIT (I13). The gate's exposed pair is
     the truth about what is in force; the manager's store is the truth about what was intended.
     Disagreement resolves toward the gate and is audited.
@@ -936,7 +960,15 @@ def reconcile(state: State, policy: Policy, gate_fence: Fence | None, gate_mappi
     - PREPARED without COMMITTED: abandoned, never half-applied (the gate dropped or will drop it).
     - COMMITTED whose fence the gate shows in force: the gate applied it -- it is active.
     - COMMITTED whose fence the gate does not show: the gate never activated it -- abandoned.
-    The manager mints nothing here: the conn in force stays in force (§0)."""
+    The manager mints nothing here: the conn in force stays in force (§0).
+
+    AN ABORT THE MANAGER DID NOT SEE (crowsnest-dev#290). With the manager unhealthy, the NAVIGATIONAL
+    or OVERALL assignee calls the gate's narrow abort_automation, and the gate fences alone. When the
+    gate's `gate_cause` says that is what produced the fence it now exposes -- and the manager's record
+    says otherwise -- the abort is completed here as the manager would have done it (#271): every
+    function a process holds reverts to the requester at method 2 with one revision bump, and the
+    automation's conn lease ends. A CONN lapse or an invalid source reverts nothing: that is
+    comms_loss_behaviour. Once adopted, the record equals the gate's, so it never happens twice."""
     st, audits, effects = state, [], []
     for t in list(state.transfers.values()):
         if t.phase == PREPARED:
@@ -952,6 +984,9 @@ def reconcile(state: State, policy: Policy, gate_fence: Fence | None, gate_mappi
                 st = replace(st, transfers={**st.transfers, t.transfer_id: nt})
                 audits.append(_audit("abandoned", transfer_id=t.transfer_id, reason=nt.detail))
     gate = InForce(tuple(gate_mappings), gate_station, gate_fence)
+    if (gate_cause is not None and gate_cause.kind == GATE_ABORT and gate_fence is not None
+            and gate_cause.fence == gate_fence and st.in_force.fence != gate_fence):
+        st, effects, audits = _gate_abort(st, policy, gate_cause, effects, audits)
     # A manager that has recorded nothing yet (a fresh store) has nothing to disagree with.
     if st.in_force.fence is not None and gate != st.in_force:
         audits.append(_audit("reconcile_disagreement", manager_fence=_fence_json(st.in_force.fence),
@@ -959,6 +994,27 @@ def reconcile(state: State, policy: Policy, gate_fence: Fence | None, gate_mappi
         effects.append(Alarm("the gate's state differed from the manager's record; the gate's was adopted"))
     st = replace(st, in_force=gate, active_station=gate_station or st.active_station, reconciled=True)
     return Decision(st, ACCEPTED, "", tuple(effects), (*audits, _audit("reconciled", fence=_fence_json(gate_fence))))
+
+
+def _gate_abort(st: State, policy: Policy, cause: GateCause, effects: list, audits: list):
+    """Complete a direct abort the gate ran alone (#290): what `_activate` does for ABORT_AUTOMATION."""
+    who = cause.requested_by
+    # The requester's session, as this manager holds it, is the lease the reverted functions name.
+    lease_id = next((lease.token for slot in (session_slot(NAVIGATIONAL), session_slot(OVERALL))
+                     if (lease := st.leases.get(slot)) is not None and lease.holder == who), "")
+    effects, audits = [*effects], [*audits]
+    conn = st.leases.get(CONN)
+    if conn is not None and policy.is_software(conn.holder):
+        leases = {k: v for k, v in st.leases.items() if k != CONN}
+        st = replace(st, leases=leases)  # the automation's conn was fenced by the gate; its lease ends
+        effects.append(PublishLease(CONN, True, conn))
+    st, reverted = _revert_to(st, policy, who, lease_id)
+    if reverted:
+        effects.append(PublishNavigation())
+    audits.append(_audit("navigation_reverted", via="gate_abort", kind=ABORT_AUTOMATION, functions=reverted, to=who,
+                         revision=st.navigation_revision, fence=_fence_json(cause.fence),
+                         assignment_id=cause.assignment_id, assignment_revision=cause.assignment_revision))
+    return st, effects, audits
 
 
 # ---------------------------------------------------------------------------- maintenance

@@ -99,6 +99,17 @@ def slot_path(vessel_id: str, slot: str) -> str:
     return vessel_id if slot == model.CONN else f"{vessel_id}/{slot}"
 
 
+_CAUSE_KINDS = {1: "abort_automation", 2: "conn_lapse", 3: "invalid_source", 4: "local_fallback"}
+
+
+def cause_from_proto(pb) -> model.GateCause | None:
+    """keelson FenceCause (GateState.last_fence_cause, #290), read by field; None without a fence."""
+    if not pb.HasField("fence") or not pb.fence.term:
+        return None
+    return model.GateCause(_CAUSE_KINDS.get(int(pb.kind), "unspecified"), Fence(pb.fence.term, int(pb.fence.generation)),
+                           pb.requested_by, pb.assignment_id, int(pb.assignment_revision), pb.reason)
+
+
 def heard_constraint(pb) -> model.HeardConstraint | None:
     """A `PropulsionConstraint` as the manager hears it (crowsnest-dev#270); None without a fence. Read by
     field, so this module does not need the type in its SDK."""

@@ -51,4 +51,7 @@ class ZenohGate:
     def exposed(self):
         st = self._call("get_gate_state", GetGateStateRequest(), GateState)
         fence = codec.fence_from_proto(st.fence) if st.HasField("fence") else None
-        return fence, tuple(codec.mapping_from_proto(m) for m in st.mappings), st.active_control_station
+        # keelson GateState.last_fence_cause (#290), in the builds that carry it; otherwise no cause.
+        cause = (codec.cause_from_proto(st.last_fence_cause)
+                 if "last_fence_cause" in st.DESCRIPTOR.fields_by_name and st.HasField("last_fence_cause") else None)
+        return fence, tuple(codec.mapping_from_proto(m) for m in st.mappings), st.active_control_station, cause

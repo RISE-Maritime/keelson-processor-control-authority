@@ -61,8 +61,15 @@ and ACKs with it, and only a COMMIT that the manager has already written to its 
   - **Why:** the CONN fence alone leaves the delegation in the document. It would become executable
     again through a later carry-out envelope. The revision bump also refuses a stale `NAV_FUNCTION`
     candidate on the DECISION check.
-  - **Not yet covered:** an abort the gate performs alone, while the manager is down, is not
-    recognised at reconcile yet (crowsnest-dev#290).
+  - **An abort the gate ran alone** (crowsnest-dev#290). While the manager is down the assignee
+    calls the gate's narrow `abort_automation`, and the gate records why it moved its fence
+    (`GateState.last_fence_cause`). At reconcile the manager completes that abort exactly as its own:
+    every process-held function goes to the requester at method 2 with one revision bump, under
+    their session lease, and the automation's conn lease ends, audited `navigation_reverted`
+    `via: gate_abort`. This happens only when the cause is an abort AND it produced the fence the gate
+    exposes. A CONN lapse reverts nothing (that is comms_loss_behaviour). Once adopted the record
+    equals the gate's, so it never repeats. A build without the field yields no cause, and nothing is
+    reverted.
 - **Never software:** OVERALL and NAVIGATIONAL_COMMAND are never assigned to a process.
 - **`legacy_single_operator`:** the two assignments are synthesised for the conn holder and marked
   `synthesised`.

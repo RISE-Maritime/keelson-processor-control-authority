@@ -458,6 +458,62 @@ def test_a_take_control_activated_on_reconcile_reverts_as_well(tmp_path, clock, 
     _assert_taken_back(m2, rev)
 
 
+# ---------------------------------------------------------------------------- crowsnest-dev#290: an abort the gate ran alone
+
+
+def _gate_aborts_while_the_manager_is_down(m, gate, nav, kind="abort_automation"):
+    """The manager dies; anna calls the gate's narrow abort_automation; the gate fences alone and says why."""
+    m.store.close()
+    gate.fence_alone(kind, **({"requested_by": "anna@ROC-2", "assignment_id": nav.assignment_id,
+                                "assignment_revision": nav.revision} if kind == "abort_automation" else {}))
+
+
+def test_an_abort_the_gate_ran_alone_takes_back_the_navigators_functions_at_reconcile(tmp_path, clock, gate):
+    bus = Bus()
+    m, nav, rev = _setup_automation(tmp_path, clock, gate)
+    _gate_aborts_while_the_manager_is_down(m, gate, nav)
+    m2 = make(tmp_path, clock, gate, bus=bus)  # boots, rebases its leases, reconciles
+    assert m2.state.reconciled and m2.state.in_force.fence == gate.fence
+    _assert_taken_back(m2, rev)  # the requester's at method 2, the envelope kept, one revision, audited
+    audit = [r for r in m2.history() if r["event"] == "navigation_reverted"][0]
+    assert audit["via"] == "gate_abort" and audit["fence"] == {"term": gate.term, "generation": gate.generation}
+    assert model.CONN not in m2.state.leases  # the automation's conn ended with the abort
+    assert any(isinstance(e, model.PublishLease) and e.slot == model.CONN and e.released for e in bus.effects)
+    assert any(isinstance(e, model.PublishNavigation) for e in bus.effects)
+    # Once adopted it is the manager's record too: another reconcile, or a restart, changes nothing.
+    m2.reconcile()
+    m2.store.close()
+    m3 = make(tmp_path, clock, gate)
+    assert m3.state.navigation_revision == rev + 1
+    assert len([r for r in m3.history() if r["event"] == "navigation_reverted"]) == 1
+
+
+def test_a_conn_lapse_the_gate_fenced_alone_reverts_nothing(tmp_path, clock, gate):
+    m, nav, rev = _setup_automation(tmp_path, clock, gate)
+    before = dict(m.state.navigation)
+    _gate_aborts_while_the_manager_is_down(m, gate, nav, kind="conn_lapse")
+    m2 = make(tmp_path, clock, gate)
+    assert m2.state.navigation == before and m2.state.navigation_revision == rev  # comms_loss, not an abort
+    assert not [r for r in m2.history() if r["event"] == "navigation_reverted"]
+
+
+def test_an_abort_cause_for_another_fence_reverts_nothing(tmp_path, clock, gate):
+    m, nav, rev = _setup_automation(tmp_path, clock, gate)
+    _gate_aborts_while_the_manager_is_down(m, gate, nav)
+    gate.generation += 1  # the gate moved again; its recorded cause names the older fence
+    m2 = make(tmp_path, clock, gate)
+    assert m2.state.navigation_revision == rev and not [r for r in m2.history() if r["event"] == "navigation_reverted"]
+
+
+def test_an_abort_through_the_manager_is_reverted_once_and_reconcile_adds_nothing(tmp_path, clock, gate):
+    m, nav, rev = _setup_automation(tmp_path, clock, gate)
+    d = m.transfer(TransferRequest(model.ABORT_AUTOMATION, "anna@ROC-2", "ROC-2", assignment_revision=nav.revision,
+                                   session_token="sess-2"))
+    assert d.outcome == model.ACCEPTED
+    m.reconcile()
+    _assert_taken_back(m, rev)  # exactly one revert, the manager's own
+
+
 def test_handing_the_conn_to_the_navigator_reverts_nothing(tmp_path, clock, gate):
     m = make(tmp_path, clock, gate)
     master(m, "ted@ROC-1", "ROC-1")

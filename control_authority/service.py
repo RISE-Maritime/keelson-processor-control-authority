@@ -28,7 +28,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol
 
 from . import attestation, model, vehicle_control
-from .model import Decision, Fence, Mapping, Policy, State, Transfer, TransferRequest
+from .model import Decision, Fence, Policy, State, Transfer, TransferRequest
 
 log = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ class GatePort(Protocol):
 
     def commit(self, transfer_id: str, fence: Fence) -> tuple[bool, str]: ...
 
-    def exposed(self) -> tuple[Fence | None, tuple[Mapping, ...], str]: ...
+    def exposed(self) -> tuple: ...  # (fence, mappings, station[, cause]) -- the cause since #290
 
 
 def mono_ms() -> int:
@@ -137,11 +137,12 @@ class Manager:
 
     def reconcile(self) -> bool:
         try:
-            fence, mappings, station = self.gate.exposed()
+            fence, mappings, station, *rest = self.gate.exposed()
         except GateUnreachable as e:
             log.error("the gate is unreachable (%s): no transfer is accepted until it is read", e)
             return False
-        self._apply(model.reconcile(self.state, self.policy, fence, mappings, station, self.now_ms()))
+        cause = rest[0] if rest else None  # why the gate last fenced alone (#290), where the gate says
+        self._apply(model.reconcile(self.state, self.policy, fence, mappings, station, self.now_ms(), cause))
         return True
 
     # ------------------------------------------------------------------ transfers
