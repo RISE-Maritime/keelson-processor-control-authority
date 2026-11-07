@@ -224,3 +224,26 @@ def test_the_principal_survives_a_restart_and_the_challenges_do_not(tmp_path):
 
 def svc_challenge(req) -> bytes:
     return pb.AttestationClaim.FromString(req.caller.attestation.claim).challenge
+
+
+def test_the_shared_vector_with_the_gates_copy():
+    """keelson-processor-control-gate's control_gate/attestation.py is a port of this verifier, for the
+    direct abort (crowsnest-dev#316). Its tests/test_abort_attestation.py pins the same seed, key id
+    and claim: a change to the key format or to the claim's encoding that one copy does not follow fails
+    in one repo or the other."""
+    import hashlib
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    seed_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    public = base64.b64encode(seed_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
+    assert public == "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+    keys = attestation.parse_keys({"roc1-a": {"service_id": "roc1-authority", "public_key": public}})
+    claim = pb.AttestationClaim(service_id="roc1-authority", key_id="roc1-a", operator_id="anna@ROC-2", site="ROC-2",
+                                station="ROC-2/console-1", session_id="sess-9", sequence=1, challenge=b"\x07" * 16,
+                                procedure="control_gate/v1/abort_automation",
+                                request_sha256=b"\x00" * 32).SerializeToString(deterministic=True)
+    assert hashlib.sha256(claim).hexdigest() == "b0476d3bc1f2e749b1064505d7309f833a266dbb126dda71ccb7e7f525572db7"
+    signature = seed_key.sign(claim)  # Ed25519 is deterministic
+    assert hashlib.sha256(signature).hexdigest() == "eec00c942b4bff59c6224ac637aa67f7db281cca162874b55f84dd8849a864c6"
+    Ed25519PublicKey.from_public_bytes(keys["roc1-a"].public_key).verify(signature, claim)
