@@ -326,6 +326,32 @@ def test_take_control_from_automation_moves_station_map_and_epoch_together(tmp_p
     assert m.state.leases[model.CONN].holder == "anna@ROC-2"
 
 
+def test_a_station_change_publishes_the_record_at_once_and_a_repeat_does_not(tmp_path, clock, gate):
+    """The overall record names the active control station, and every station shows it (crowsnest-dev#317,
+    MASS Code III/18.2.5 EP 1 .4): a reader must not wait for the next heartbeat to learn it moved."""
+    bus = Bus()
+    m = make(tmp_path, clock, gate, bus=bus)
+    master(m, "ted@ROC-1", "ROC-1")
+    a = master(m, "anna@ROC-2", "ROC-2", model.NAVIGATIONAL, token="sess-2")
+    take_conn(m, "ted@ROC-1", "ROC-1")
+    _automation_holds_the_conn(m)
+
+    def published():
+        return len([e for e in bus.effects if isinstance(e, model.PublishAssignments)])
+
+    before = published()
+    d = m.transfer(TransferRequest(model.TAKE_CONTROL, "anna@ROC-2", "ROC-2", assignment_revision=a.revision,
+                                   session_token="sess-2", mappings=human_map("ROC-2")))
+    assert d.outcome == model.ACCEPTED, d.detail
+    assert published() == before + 1
+    _automation_holds_the_conn(m)
+    before = published()
+    d = m.transfer(TransferRequest(model.TAKE_CONTROL, "anna@ROC-2", "ROC-2", assignment_revision=a.revision,
+                                   session_token="sess-2", mappings=human_map("ROC-2")))
+    assert d.outcome == model.ACCEPTED, d.detail
+    assert m.state.active_station == "ROC-2" and published() == before
+
+
 def test_take_control_needs_the_assignment_and_its_live_session(tmp_path, clock, gate):
     m = make(tmp_path, clock, gate)
     master(m)

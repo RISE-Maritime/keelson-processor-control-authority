@@ -914,6 +914,8 @@ def _activate(state: State, policy: Policy, t: Transfer, now_ms: int, how: str) 
     nt = replace(t, phase=ACTIVE)
     st = replace(state, leases=leases, transfers={**state.transfers, t.transfer_id: nt},
                  in_force=InForce(mappings, t.station, fence), active_station=t.station)
+    if t.station != state.active_station:
+        effects.append(PublishAssignments())  # the record names the station, and a reader must not wait a heartbeat to learn it moved
     audits = [_audit(how, transfer_id=t.transfer_id, kind=t.kind, station=t.station, fence=_fence_json(fence),
                      **_timings(("prepare_ms", t.prepare_ms), ("commit_ms", t.commit_ms)),
                      new_map=_map_json(mappings))]
