@@ -10,11 +10,10 @@ requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = [
     # EXACT pin, never a path or a range. The types (role leases, CommandAssignment, ControlMapping,
-    # TransferPrepare/Ack/Commit, Fence) exist only on keelson PR #331; this is the experimental build
-    # that carries it, tracked by crowsnest-dev #84. Repin to the release that carries #331 when it merges.
-    # PENDING: the build has not been cut yet; until it is, develop against the #331 worktree's SDK in a
-    # local venv (README, "Developing before the build").
-    "keelson==0.6.0.dev21",
+    # TransferPrepare/Ack/Commit, Fence), the attestation (#383) and the maintenance calls (#377) exist
+    # only on open keelson PRs; this experimental build (0.6.0-experimental.23, its tag is the manifest)
+    # carries them, tracked by crowsnest-dev #84. Repin to the release that carries them when they merge.
+    "keelson==0.6.0.dev23",
     # Ed25519 for the ROC service's attestation (crowsnest-dev#312).
     "cryptography==50.0.2",
 ]

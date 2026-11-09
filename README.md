@@ -245,31 +245,18 @@ station.** It is labelled as the migration path and is off unless the flag is gi
 - **Automation rows** (`navigation/0`) compile like any other row, given a source in the table.
   The navigator publishes no percentage setpoint subject yet, so the example table has none.
 
-## Developing before the build
+## Developing
 
-The pin is an experimental build that carries both #331 and the interfaces branch. That build
-includes only open PRs, so the interfaces branch must be opened as a PR before the build is cut.
-Until the build exists, `uv sync` cannot resolve the pin. In the meantime, develop against the
-interfaces worktree's SDK **without committing that**:
+The pin is an experimental build, `keelson==0.6.0.dev23` (`0.6.0-experimental.23`). It carries #331,
+the interfaces PR #359, the attestation PR #383 and the maintenance PR #377, and its tag message
+lists every PR in it. Always install it from PyPI, never from a local checkout:
 
 ```bash
 uv venv --python 3.13 .venv
-uv pip install --python .venv/bin/python -e ../keelson.worktrees/authority-interfaces/sdks/python pytest==8.3.4 ruff==0.14.11
+uv pip install --python .venv/bin/python -e '.[dev]'
 .venv/bin/python -m pytest -q          # unit + e2e (e2e: loopback, multicast scouting off)
 .venv/bin/ruff check .
 ```
-
-When the build exists: set its exact version in `pyproject.toml`, run `uv lock`, and use
-`uv sync --locked --extra dev`.
-
-**Attestation needs keelson#383** (`feat/authority-attestation`, stacked on #377) and
-`cryptography`. Develop against that worktree's SDK in the same way.
-
-**Maintenance needs a newer build than the pin.** `MaintenanceState`, the four maintenance calls and
-`ResolvedControl` are on keelson's `feat/maintenance-state` branch, stacked on #361 and #359, and
-`0.6.0.dev21` does not carry them. Until an experimental build carries all three, develop against
-that worktree's SDK, as above. CI on the pin fails the maintenance tests, and only those, until the
-pin moves.
 
 ## Not in this cut
 

@@ -25,7 +25,7 @@ it is merged or run anywhere but the isolated tests.** Every commit message carr
   decision is tested there or through service.py against `tests/fakegate.py`.
 - **One lock decides** (rpc.Handlers): every request, tick and heartbeat, gate round trips included.
 - **Tests never touch a network**, and nothing runs against a vessel or the shared Zenoh network.
-- **keelson is an exact published pin** (README, "Developing before the build"). Never commit a path
+- **keelson is an exact published pin** (README, "Developing"). Never commit a path
   or a local build.
 
 ## Commands
