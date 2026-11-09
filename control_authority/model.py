@@ -228,6 +228,10 @@ class Transfer:
     reverts_lease_id: str = ""
     # Who asked for it, as attested; {} without an attestation (crowsnest-dev#312).
     principal: dict = field(default_factory=dict)
+    # How long the gate took to answer PREPARE and COMMIT, in ms on this process's monotonic clock
+    # (crowsnest-dev#319; COMMAND-ARCHITECTURE §7's < 100 ms). Measurement only: no decision reads them.
+    prepare_ms: float | None = None
+    commit_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -852,25 +856,33 @@ def begin_transfer(state: State, policy: Policy, req: TransferRequest, now_ms: i
                             old_fence=_fence_json(state.in_force.fence), reason=req.reason),), tid)
 
 
+def _timings(*pairs) -> dict:
+    """The round trips measured so far, for an audit record: only those that were measured."""
+    return {k: v for k, v in pairs if v is not None}
+
+
 def on_ack(state: State, transfer_id: str, accepted: bool, fence: Fence | None, reason: str = "",
-           rejected_mapping_ids=()) -> Decision:
+           rejected_mapping_ids=(), prepare_ms: float | None = None) -> Decision:
     """The gate's answer to a PREPARE. ACK: record COMMITTED(map, station, fence) -- durably, before
     the COMMIT is sent (I13). NAK: the transfer is rejected, all or nothing (I10)."""
     t = state.transfers.get(transfer_id)
     if t is None or t.phase != PREPARED:
         return _same(state, ACCEPTED, "an answer to no proposal in flight", (_audit("stray_ack", transfer_id=transfer_id),))
     if not accepted or fence is None:
-        nt = replace(t, phase=REJECTED, detail=reason or "refused by the gate")
+        nt = replace(t, phase=REJECTED, detail=reason or "refused by the gate", prepare_ms=prepare_ms)
         return Decision(replace(state, transfers={**state.transfers, transfer_id: nt}), REFUSED_BY_GATE, nt.detail, (),
                         (_audit("rejected", transfer_id=transfer_id, reason=nt.detail,
-                                rejected_mapping_ids=list(rejected_mapping_ids)),), transfer_id, tuple(rejected_mapping_ids))
-    nt = replace(t, phase=COMMITTED, fence=fence)
+                                rejected_mapping_ids=list(rejected_mapping_ids), **_timings(("prepare_ms", prepare_ms))),),
+                        transfer_id, tuple(rejected_mapping_ids))
+    nt = replace(t, phase=COMMITTED, fence=fence, prepare_ms=prepare_ms)
     return Decision(replace(state, transfers={**state.transfers, transfer_id: nt}), PENDING, "",
                     (GateCommit(transfer_id, fence),),
-                    (_audit("committed", transfer_id=transfer_id, fence=_fence_json(fence)),), transfer_id)
+                    (_audit("committed", transfer_id=transfer_id, fence=_fence_json(fence), **_timings(("prepare_ms", prepare_ms))),),
+                    transfer_id)
 
 
-def on_commit_reply(state: State, policy: Policy, transfer_id: str, ok: bool, now_ms: int, reason: str = "") -> Decision:
+def on_commit_reply(state: State, policy: Policy, transfer_id: str, ok: bool, now_ms: int, reason: str = "",
+                    commit_ms: float | None = None) -> Decision:
     """The gate activated the transfer, or it no longer remembers it (it restarted after its ACK). On
     activation: station, map and fence change together, and the new conn lease is installed with the
     fence the gate minted. On a NAK: abandoned, and nothing is proposed again until reconciled."""
@@ -878,11 +890,12 @@ def on_commit_reply(state: State, policy: Policy, transfer_id: str, ok: bool, no
     if t is None or t.phase != COMMITTED:
         return _same(state, ACCEPTED, "a commit reply for no committed transfer", (_audit("stray_commit_reply", transfer_id=transfer_id),))
     if not ok:
-        nt = replace(t, phase=ABANDONED, detail=reason or "the gate refused the commit")
+        nt = replace(t, phase=ABANDONED, detail=reason or "the gate refused the commit", commit_ms=commit_ms)
         st = replace(state, transfers={**state.transfers, transfer_id: nt}, reconciled=False)
         return Decision(st, REFUSED_BY_GATE, nt.detail, (Alarm(f"transfer {transfer_id} not applied: {nt.detail}"),),
-                        (_audit("abandoned", transfer_id=transfer_id, reason=nt.detail),), transfer_id)
-    return _activate(state, policy, t, now_ms, "active")
+                        (_audit("abandoned", transfer_id=transfer_id, reason=nt.detail,
+                                **_timings(("prepare_ms", t.prepare_ms), ("commit_ms", commit_ms))),), transfer_id)
+    return _activate(state, policy, replace(t, commit_ms=commit_ms), now_ms, "active")
 
 
 def _activate(state: State, policy: Policy, t: Transfer, now_ms: int, how: str) -> Decision:
@@ -902,6 +915,7 @@ def _activate(state: State, policy: Policy, t: Transfer, now_ms: int, how: str) 
     st = replace(state, leases=leases, transfers={**state.transfers, t.transfer_id: nt},
                  in_force=InForce(mappings, t.station, fence), active_station=t.station)
     audits = [_audit(how, transfer_id=t.transfer_id, kind=t.kind, station=t.station, fence=_fence_json(fence),
+                     **_timings(("prepare_ms", t.prepare_ms), ("commit_ms", t.commit_ms)),
                      new_map=_map_json(mappings))]
     if t.kind in (TAKE_CONTROL, ABORT_AUTOMATION):
         st, reverted = _revert_navigation(st, policy, t)
@@ -941,14 +955,16 @@ def _revert_to(state: State, policy: Policy, who: str, lease_id: str) -> tuple[S
     return replace(state, navigation=nav, navigation_revision=state.navigation_revision + 1), reverted
 
 
-def abandon(state: State, transfer_id: str, why: str) -> Decision:
-    """A PREPARE nobody answered within its TTL. The gate drops its reservation on its own clock."""
+def abandon(state: State, transfer_id: str, why: str, waited_ms: float | None = None) -> Decision:
+    """A PREPARE nobody answered within its TTL. The gate drops its reservation on its own clock.
+    `waited_ms` is how long this manager waited: labelled `unanswered`, because no gate answered it."""
     t = state.transfers.get(transfer_id)
     if t is None or t.phase != PREPARED:
         return _same(state, ACCEPTED)
     nt = replace(t, phase=ABANDONED, detail=why)
     return Decision(replace(state, transfers={**state.transfers, transfer_id: nt}), REFUSED_BY_GATE, why, (),
-                    (_audit("abandoned", transfer_id=transfer_id, reason=why),), transfer_id)
+                    (_audit("abandoned", transfer_id=transfer_id, reason=why, **_timings(("unanswered_prepare_ms", waited_ms))),),
+                    transfer_id)
 
 
 def reconcile(state: State, policy: Policy, gate_fence: Fence | None, gate_mappings, gate_station: str, now_ms: int,

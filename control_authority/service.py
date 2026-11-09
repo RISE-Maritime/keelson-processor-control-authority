@@ -75,6 +75,11 @@ def mono_ms() -> int:
     return int(time.monotonic() * 1000)
 
 
+def elapsed_clock_ms() -> float:
+    """Sub-millisecond, for timing the gate's round trips (crowsnest-dev#319); `mono_ms` is whole ms."""
+    return time.perf_counter() * 1000
+
+
 def wall_ms() -> int:
     """For audit timestamps only -- never for an expiry (§0)."""
     return int(time.time() * 1000)
@@ -84,7 +89,7 @@ class Manager:
     def __init__(self, *, store, policy: Policy, vessel_id: str, gate: GatePort,
                  publish: Callable[[object, State], None], now_ms: Callable[[], int] = mono_ms,
                  audit_ms: Callable[[], int] = wall_ms, vehicle: VehicleControlPort | None = None,
-                 payload_gates: PayloadGatePort | None = None):
+                 payload_gates: PayloadGatePort | None = None, elapsed_ms: Callable[[], float] = elapsed_clock_ms):
         self.store = store
         self.policy = policy
         self.vessel_id = vessel_id
@@ -92,6 +97,7 @@ class Manager:
         self._publish = publish
         self.now_ms = now_ms
         self.audit_ms = audit_ms
+        self.elapsed_ms = elapsed_ms
         self.state: State | None = None
         # What the maintenance guards read, on local receipt. Never persisted (model.Heard).
         self.heard = model.Heard()
@@ -161,24 +167,36 @@ class Manager:
         last = d
         for effect in d.effects:
             if isinstance(effect, model.GatePrepare):
+                started = self.elapsed_ms()
                 try:
                     ack = self.gate.prepare(effect.transfer, effect.prepare_ttl_ms)
                 except GateUnreachable as e:
-                    return self._apply(model.abandon(self.state, effect.transfer.transfer_id, f"the gate is unreachable: {e}"))
+                    return self._apply(model.abandon(self.state, effect.transfer.transfer_id, f"the gate is unreachable: {e}",
+                                                     self._since(started)))
+                prepare_ms = self._since(started)
                 nxt = self._apply(model.on_ack(self.state, effect.transfer.transfer_id, ack.accepted, ack.fence,
-                                               ack.reason, ack.rejected_mapping_ids))
+                                               ack.reason, ack.rejected_mapping_ids, prepare_ms))
                 last = self._follow(nxt) if nxt.outcome == model.PENDING else nxt
             elif isinstance(effect, model.GateCommit):
+                started = self.elapsed_ms()
                 try:
                     ok, reason = self.gate.commit(effect.transfer_id, effect.fence)
                 except GateUnreachable as e:
                     # COMMITTED stays recorded; whether the gate applied it is for reconcile() to find.
                     log.error("COMMIT %s unanswered (%s): reconcile before the next transfer", effect.transfer_id, e)
                     self.state = replace(self.state, reconciled=False)
+                    self.store.commit(self.state, (model._audit("commit_unanswered", transfer_id=effect.transfer_id,
+                                                                reason=str(e), unanswered_commit_ms=self._since(started)),),
+                                      self.audit_ms())
                     return Decision(self.state, model.REFUSED_BY_GATE, f"the gate did not answer the commit: {e}",
                                     transfer_id=effect.transfer_id)
-                last = self._apply(model.on_commit_reply(self.state, self.policy, effect.transfer_id, ok, self.now_ms(), reason))
+                last = self._apply(model.on_commit_reply(self.state, self.policy, effect.transfer_id, ok, self.now_ms(), reason,
+                                                         self._since(started)))
         return last
+
+    def _since(self, started: float) -> float:
+        """Milliseconds since `started`, to a tenth of a ms (crowsnest-dev#319). Measurement only."""
+        return round(self.elapsed_ms() - started, 1)
 
     # ------------------------------------------------------------------ leases, assignments, navigation
 
