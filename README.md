@@ -243,7 +243,7 @@ station.** It is labelled as the migration path and is off unless the flag is gi
   (default 1 s) raises one alarm per episode and is retried at every tick. Every install and clear
   is audited (`vehicle_control_installed` / `_cleared` / `_failed`).
 - **Automation rows** (`navigation/0`) compile like any other row, given a source in the table.
-  The navigator publishes no percentage setpoint subject yet, so the example table has none.
+  The ANS publishes no percentage setpoint subject yet, so the example table has none.
 
 ## Developing
 

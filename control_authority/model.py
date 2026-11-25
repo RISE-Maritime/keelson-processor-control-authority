@@ -222,7 +222,7 @@ class Transfer:
     conn_site: str = ""
     conn_token: str = ""
     conn_lease_id: str = ""
-    # TAKE_CONTROL / ABORT_AUTOMATION: who takes back the navigator's navigation functions on
+    # TAKE_CONTROL / ABORT_AUTOMATION: who takes back the ANS's navigation functions on
     # activation, and the session lease that proves them present (crowsnest-dev#271).
     reverts_to: str = ""
     reverts_lease_id: str = ""
@@ -801,7 +801,7 @@ def begin_transfer(state: State, policy: Policy, req: TransferRequest, now_ms: i
         human = not policy.is_software(conn_holder)
         if human and not station and policy.command_profile != "operational":
             station = conn_site  # test / legacy: the first taker's station; in operational it is OVERALL's to set
-        # Full automation (the conn handed to the navigator) is not held to a human station; its rows
+        # Full automation (the conn handed to the ANS) is not held to a human station; its rows
         # must then name automation sources, which _human_map_problems checks.
         if human and conn_site != station:
             return _same(state, REFUSED_UNAUTHORISED,
@@ -931,10 +931,10 @@ def _activate(state: State, policy: Policy, t: Transfer, now_ms: int, how: str) 
 def _revert_navigation(state: State, policy: Policy, t: Transfer) -> tuple[State, list[str]]:
     """TAKE CONTROL AND ABORT TAKE BACK THE DELEGATION (crowsnest-dev#271, decided by Ted on 2026-11-05;
     COMMAND-ARCHITECTURE §4.1). Every navigation function a software principal holds reverts to the
-    human who acted, at method 2 (Directed: the navigator advises, and carries out only on order), in
+    human who acted, at method 2 (Directed: the ANS advises, and carries out only on order), in
     the SAME decision that activates the CONN, map and epoch, so the two are durable together.
 
-    Why: the CONN fence already stops the navigator's motion, but a delegation left in the document
+    Why: the CONN fence already stops the ANS's motion, but a delegation left in the document
     outlives the take-over -- it becomes executable again the moment the human pre-authorises a
     carry-out envelope, and the HMI shows automation holding functions it no longer exercises. The
     revision bump is a second, independent fence: a NAV_FUNCTION candidate under the old revision is
